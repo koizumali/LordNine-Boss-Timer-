@@ -6,7 +6,7 @@ from flask import Flask
 from threading import Thread
 import os
 import warnings 
-from pymongo import MongoClient
+
 
 
 # Suppress the Flask development server warning
@@ -36,18 +36,7 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-try:
-    mongodb_uri = os.environ['MONGODB_URI']
-    client = MongoClient(mongodb_uri)
-    db = client.boss_tracker
-    bosses_collection = db.bosses
-    kill_data_collection = db.kill_data
-    print("Connected to MongoDB successfully!")
-except Exception as e:
-    print(f"Error connecting to MongoDB: {e}")
-    # Fallback to in-memory storage if MongoDB fails
-    bosses_collection = None
-    kill_data_collection = None
+
 
 # Set Philippine Timezone
 PH_TZ = pytz.timezone('Asia/Manila')

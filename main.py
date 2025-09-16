@@ -5,9 +5,8 @@ import pytz
 from flask import Flask
 from threading import Thread
 import os
-import warnings 
-
-
+import warnings
+import asyncio
 
 # Suppress the Flask development server warning
 warnings.filterwarnings("ignore", message="This is a development server.")
@@ -19,15 +18,18 @@ app = Flask(__name__)
 def home():
     return "Bot is alive and running! 🚀"
 
-def run():
-    app.run(host='0.0.0.0', port=8080)
+def run_flask():
+    """Run Flask in a separate thread"""
+    app.run(host='0.0.0.0', port=8080, debug=False, use_reloader=False)
 
 def keep_alive():
-    t = Thread(target=run)
+    """Start Flask in a background thread"""
+    t = Thread(target=run_flask)
+    t.daemon = True  # Make thread daemon so it exits when main thread exits
     t.start()
 
 # PASTE YOUR BOT TOKEN HERE
-BOT_TOKEN = os.getenv("DISCORD_TOKEN")
+BOT_TOKEN = os.getenv("DISCORD_TOKEN") or "YOUR_BOT_TOKEN_HERE"
 
 # SPECIFIC CHANNEL FOR BOSS NOTIFICATIONS (replace with your channel ID)
 NOTIFICATION_CHANNEL_ID = 1416149291839258696  # Replace with your actual channel ID
@@ -35,8 +37,6 @@ NOTIFICATION_CHANNEL_ID = 1416149291839258696  # Replace with your actual channe
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix='!', intents=intents)
-
-
 
 # Set Philippine Timezone
 PH_TZ = pytz.timezone('Asia/Manila')
@@ -255,6 +255,20 @@ async def on_ready():
     print(f'{bot.user} is online! Tracking {len(ALL_BOSSES)} bosses.')
     print(f'Using Philippine Time (PHT)')
     print(f'Notification channel ID: {NOTIFICATION_CHANNEL_ID}')
+    
+    # Test if we can access the notification channel
+    channel = bot.get_channel(NOTIFICATION_CHANNEL_ID)
+    if channel:
+        print(f'✅ Found notification channel: {channel.name}')
+        try:
+            await channel.send("🤖 Boss tracker bot is now online and ready!")
+        except discord.Forbidden:
+            print("❌ Missing permissions to send messages in the notification channel")
+        except Exception as e:
+            print(f"❌ Error sending test message: {e}")
+    else:
+        print(f"❌ Could not find notification channel with ID {NOTIFICATION_CHANNEL_ID}")
+    
     check_spawns.start()
 
 @bot.command(name='kill', help='Report a boss kill with current time. Example: !kill Amentis')
@@ -576,99 +590,124 @@ async def check_time(ctx):
     current_time = get_ph_time()
     await ctx.send(f"⏰ **Current Philippine Time:** {current_time.strftime('%Y-%m-%d %I:%M:%S %p PHT')}")
 
+@bot.command(name='test')
+async def test_command(ctx):
+    """Test if the bot can send messages"""
+    try:
+        await ctx.send("✅ Bot is working and can send messages!")
+        
+        # Test notification channel
+        channel = bot.get_channel(NOTIFICATION_CHANNEL_ID)
+        if channel:
+            await channel.send("✅ Notification channel test successful!")
+        else:
+            await ctx.send(f"❌ Could not find notification channel with ID {NOTIFICATION_CHANNEL_ID}")
+            
+    except Exception as e:
+        await ctx.send(f"❌ Error: {e}")
+
 @tasks.loop(seconds=30.0)
 async def check_spawns():
-    current_time = get_ph_time()
-    notification_time = current_time + timedelta(minutes=10)  # 10 minutes before spawn
+    try:
+        current_time = get_ph_time()
+        notification_time = current_time + timedelta(minutes=10)  # 10 minutes before spawn
 
-    # Get the specific notification channel
-    notification_channel = bot.get_channel(NOTIFICATION_CHANNEL_ID)
-    if not notification_channel:
-        print(f"❌ ERROR: Could not find notification channel with ID {NOTIFICATION_CHANNEL_ID}")
-        return
+        # Get the specific notification channel
+        channel = bot.get_channel(NOTIFICATION_CHANNEL_ID)
+        if not channel:
+            print(f"❌ ERROR: Could not find notification channel with ID {NOTIFICATION_CHANNEL_ID}")
+            return
 
-    # Check regular bosses
-    for boss_name, boss_info in list(boss_data.items()):
-        if boss_info.get("type") != "regular":
-            continue
+        # Check if bot has permission to send messages
+        if not channel.permissions_for(channel.guild.me).send_messages:
+            print(f"❌ ERROR: Bot doesn't have permission to send messages in {channel.name}")
+            return
 
-        spawn_time = boss_info["spawn_time"]
-        location = boss_info.get("location", REGULAR_BOSSES.get(boss_name, {}).get("location", "Unknown"))
+        # Check regular bosses
+        for boss_name, boss_info in list(boss_data.items()):
+            if boss_info.get("type") != "regular":
+                continue
 
-        # Check if spawn is in the next 10 minutes and not notified yet
-        if current_time < spawn_time <= notification_time and not boss_info["notified"]:
-            # Create pretty display name
-            display_name = ' '.join(word.capitalize() for word in boss_name.split())
+            spawn_time = boss_info["spawn_time"]
+            location = boss_info.get("location", REGULAR_BOSSES.get(boss_name, {}).get("location", "Unknown"))
 
-            time_left = spawn_time - current_time
-            minutes = (time_left.seconds % 3600) // 60
-            seconds = time_left.seconds % 60
+            # Check if spawn is in the next 10 minutes and not notified yet
+            if current_time < spawn_time <= notification_time and not boss_info["notified"]:
+                # Create pretty display name
+                display_name = ' '.join(word.capitalize() for word in boss_name.split())
 
-            try:
-                await notification_channel.send(
-                    f"@everyone 🚨 **{display_name} SPAWN ALERT!** 🚨\n"
-                    f"📍 **Location:** {location}\n"
-                    f"**Spawning in {minutes} minutes {seconds} seconds!**\n"
-                    f"⏰ **Spawn time:** {spawn_time.strftime('%I:%M %p PHT')}"
-                )
-                print(f"✅ Sent spawn alert for {display_name} to channel {NOTIFICATION_CHANNEL_ID}")
+                time_left = spawn_time - current_time
+                minutes = (time_left.seconds % 3600) // 60
+                seconds = time_left.seconds % 60
 
-                # Mark as notified
-                boss_info["notified"] = True
+                try:
+                    await channel.send(
+                        f"@everyone 🚨 **{display_name} SPAWN ALERT!** 🚨\n"
+                        f"📍 **Location:** {location}\n"
+                        f"**Spawning in {minutes} minutes {seconds} seconds!**\n"
+                        f"⏰ **Spawn time:** {spawn_time.strftime('%I:%M %p PHT')}"
+                    )
+                    print(f"✅ Sent spawn alert for {display_name} to channel {channel.name}")
 
-            except discord.Forbidden:
-                print(f"❌ Missing permissions to send message in channel {NOTIFICATION_CHANNEL_ID}")
-            except discord.HTTPException as e:
-                print(f"❌ Failed to send message: {e}")
+                    # Mark as notified
+                    boss_info["notified"] = True
 
-    # Check fixed-time bosses
-    for boss_name in FIXED_BOSSES:
-        next_spawn = get_next_spawn_time(boss_name)
-        if not next_spawn:
-            continue
+                except discord.Forbidden:
+                    print(f"❌ Missing permissions to send message in channel {channel.name}")
+                except discord.HTTPException as e:
+                    print(f"❌ Failed to send message: {e}")
 
-        # Check if we need to notify for this boss
-        notification_key = f"{boss_name}_notified"
-        already_notified = boss_data.get(notification_key, False)
+        # Check fixed-time bosses
+        for boss_name in FIXED_BOSSES:
+            next_spawn = get_next_spawn_time(boss_name)
+            if not next_spawn:
+                continue
 
-        if current_time < next_spawn <= notification_time and not already_notified:
-            # Create pretty display name
-            display_name = ' '.join(word.capitalize() for word in boss_name.split())
-            location = FIXED_BOSSES[boss_name]["location"]
-
-            time_left = next_spawn - current_time
-            minutes = (time_left.seconds % 3600) // 60
-            seconds = time_left.seconds % 60
-
-            try:
-                await notification_channel.send(
-                    f"@everyone 🚨 **{display_name} SPAWN ALERT!** 🚨\n"
-                    f"📍 **Location:** {location}\n"
-                    f"**Spawning in {minutes} minutes {seconds} seconds!**\n"
-                    f"⏰ **Spawn time:** {next_spawn.strftime('%I:%M %p PHT')}\n"
-                    f"📅 **Next spawn:** {next_spawn.strftime('%A, %B %d')}"
-                )
-                print(f"✅ Sent spawn alert for fixed-time boss {display_name} to channel {NOTIFICATION_CHANNEL_ID}")
-
-                # Mark as notified
-                boss_data[notification_key] = True
-
-            except discord.Forbidden:
-                print(f"❌ Missing permissions to send message in channel {NOTIFICATION_CHANNEL_ID}")
-            except discord.HTTPException as e:
-                print(f"❌ Failed to send message: {e}")
-
-    # Reset notifications for bosses that have spawned
-    for boss_name, boss_info in list(boss_data.items()):
-        if boss_info.get("type") == "regular" and boss_info["spawn_time"] < current_time:
-            boss_info["notified"] = False
-
-    # Reset notifications for fixed-time bosses that have spawned
-    for boss_name in FIXED_BOSSES:
-        next_spawn = get_next_spawn_time(boss_name)
-        if next_spawn and next_spawn < current_time:
+            # Check if we need to notify for this boss
             notification_key = f"{boss_name}_notified"
-            boss_data[notification_key] = False
+            already_notified = boss_data.get(notification_key, False)
+
+            if current_time < next_spawn <= notification_time and not already_notified:
+                # Create pretty display name
+                display_name = ' '.join(word.capitalize() for word in boss_name.split())
+                location = FIXED_BOSSES[boss_name]["location"]
+
+                time_left = next_spawn - current_time
+                minutes = (time_left.seconds % 3600) // 60
+                seconds = time_left.seconds % 60
+
+                try:
+                    await channel.send(
+                        f"@everyone 🚨 **{display_name} SPAWN ALERT!** 🚨\n"
+                        f"📍 **Location:** {location}\n"
+                        f"**Spawning in {minutes} minutes {seconds} seconds!**\n"
+                        f"⏰ **Spawn time:** {next_spawn.strftime('%I:%M %p PHT')}\n"
+                        f"📅 **Next spawn:** {next_spawn.strftime('%A, %B %d')}"
+                    )
+                    print(f"✅ Sent spawn alert for fixed-time boss {display_name} to channel {channel.name}")
+
+                    # Mark as notified
+                    boss_data[notification_key] = True
+
+                except discord.Forbidden:
+                    print(f"❌ Missing permissions to send message in channel {channel.name}")
+                except discord.HTTPException as e:
+                    print(f"❌ Failed to send message: {e}")
+
+        # Reset notifications for bosses that have spawned
+        for boss_name, boss_info in list(boss_data.items()):
+            if boss_info.get("type") == "regular" and boss_info["spawn_time"] < current_time:
+                boss_info["notified"] = False
+
+        # Reset notifications for fixed-time bosses that have spawned
+        for boss_name in FIXED_BOSSES:
+            next_spawn = get_next_spawn_time(boss_name)
+            if next_spawn and next_spawn < current_time:
+                notification_key = f"{boss_name}_notified"
+                boss_data[notification_key] = False
+
+    except Exception as e:
+        print(f"❌ Error in check_spawns: {e}")
 
 # Install pytz if not already installed
 try:
@@ -678,5 +717,8 @@ except ImportError:
     os.system('pip install pytz')
     import pytz
 
+# Start the keep-alive server
 keep_alive()
+
+# Run the bot
 bot.run(BOT_TOKEN)

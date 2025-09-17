@@ -382,132 +382,100 @@ async def check_status(ctx, *, specific_boss=None):
 
         await send_boss_status(ctx, boss_name_lower, boss_info)
     else:
-        # Show status for all bosses
-        message = "**BOSS STATUS**\n"
-        message += "```\n"
-        message += "BOSS NAME           STATUS        TIME LEFT\n"
-        message += "───────────────────────────────────────────\n"
+        # Show status for all bosses - SORTED BY SPAWN TIME
+        current_time = get_ph_time()
+        boss_statuses = []
 
-        for boss_name in sorted(ALL_BOSSES.keys()):
+        # Collect status for all bosses
+        for boss_name in ALL_BOSSES.keys():
             # Handle fixed-time bosses
             if boss_name in FIXED_BOSSES:
                 next_spawn = get_next_spawn_time(boss_name)
-                current_time = get_ph_time()
-
                 if next_spawn:
                     time_left = next_spawn - current_time
                     if time_left.total_seconds() <= 0:
                         status = "✅ ALIVE"
-                        time_str = "-"
+                        time_left_seconds = 0  # Alive bosses come first
                     else:
                         status = "❌ DEAD"
-                        time_str = format_time_left(time_left).ljust(12)
+                        time_left_seconds = time_left.total_seconds()
                 else:
                     status = "❓ UNKNOWN"
-                    time_str = "-"
-
-                display_name = ' '.join(word.capitalize() for word in boss_name.split())
-                name_display = display_name.ljust(18)
-                message += f"{name_display} {status.ljust(12)} {time_str}\n"
+                    time_left_seconds = float('inf')  # Put unknown at the end
             else:
                 # Regular bosses
                 boss_info = boss_data.get(boss_name)
-                status_line = get_boss_status_line(boss_name, boss_info)
-                message += status_line + "\n"
+                if boss_info:
+                    spawn_time = boss_info["spawn_time"]
+                    if current_time > spawn_time:
+                        status = "✅ ALIVE"
+                        time_left_seconds = 0  # Alive bosses come first
+                    else:
+                        status = "❌ DEAD"
+                        time_left_seconds = (spawn_time - current_time).total_seconds()
+                else:
+                    status = "❓ NOT KILLED"
+                    time_left_seconds = float('inf')  # Put not killed at the end
+
+            display_name = ' '.join(word.capitalize() for word in boss_name.split())
+            boss_statuses.append({
+                'name': display_name,
+                'status': status,
+                'time_left_seconds': time_left_seconds,
+                'boss_name': boss_name
+            })
+
+        # Sort bosses: alive first, then by time left (soonest first), then unknown/not killed
+        def sort_key(boss):
+            if boss['status'] == "✅ ALIVE":
+                return (0, boss['time_left_seconds'])  # Alive bosses first
+            elif boss['status'] == "❌ DEAD":
+                return (1, boss['time_left_seconds'])  # Dead bosses by time
+            else:
+                return (2, boss['time_left_seconds'])  # Unknown/not killed last
+
+        boss_statuses.sort(key=sort_key)
+
+        # Create the status message
+        message = "**BOSS STATUS** (Sorted by spawn time)\n"
+        message += "```\n"
+        message += "BOSS NAME           STATUS        TIME LEFT\n"
+        message += "───────────────────────────────────────────\n"
+
+        # Count dead bosses for highlighting
+        dead_bosses = [boss for boss in boss_statuses if boss['status'] == "❌ DEAD"]
+        
+        for i, boss in enumerate(boss_statuses):
+            # Format time left
+            if boss['status'] == "✅ ALIVE":
+                time_str = "-".ljust(12)
+            elif boss['status'] == "❌ DEAD":
+                time_str = format_time_left(timedelta(seconds=boss['time_left_seconds'])).ljust(12)
+            else:
+                time_str = "-".ljust(12)
+
+            name_display = boss['name'].ljust(18)
+            
+            # Highlight top 5 dead bosses that will spawn soonest
+            if boss['status'] == "❌ DEAD":
+                boss_index_in_dead = dead_bosses.index(boss)
+                if boss_index_in_dead < 5:
+                    message += f"🔥 {name_display} {boss['status'].ljust(12)} {time_str}\n"
+                else:
+                    message += f"   {name_display} {boss['status'].ljust(12)} {time_str}\n"
+            else:
+                message += f"   {name_display} {boss['status'].ljust(12)} {time_str}\n"
 
         message += "```"
-        await ctx.send(message)
-
-def get_boss_status_line(boss_name, boss_info):
-    """Helper function to format a single boss status line"""
-    # Create pretty display name (capitalize each word)
-    display_name = ' '.join(word.capitalize() for word in boss_name.split())
-    name_display = display_name.ljust(18)
-
-    if not boss_info:
-        return f"{name_display} ❓ NOT KILLED     -"
-
-    spawn_time = boss_info["spawn_time"]
-    current_time = get_ph_time()
-
-    if current_time > spawn_time:
-        return f"{name_display} ✅ ALIVE         -"
-    else:
-        time_left = spawn_time - current_time
-        time_str = format_time_left(time_left).ljust(12)
-        return f"{name_display} ❌ DEAD         {time_str}"
-
-async def send_boss_status(ctx, boss_name, boss_info):
-    """Send detailed status for a single regular boss"""
-    # Create pretty display name
-    display_name = ' '.join(word.capitalize() for word in boss_name.split())
-
-    spawn_time = boss_info["spawn_time"]
-    kill_time = boss_info.get("kill_time", spawn_time - timedelta(hours=REGULAR_BOSSES[boss_name]["hours"]))
-    current_time = get_ph_time()
-    respawn_hours = REGULAR_BOSSES[boss_name]["hours"]
-    location = boss_info.get("location", REGULAR_BOSSES[boss_name]["location"])
-
-    if current_time > spawn_time:
-        await ctx.send(
-            f"**{display_name}**\n"
-            f"📍 **Location:** {location}\n"
-            f"Status: ✅ **ALIVE**\n"
-            f"Killed at: {kill_time.strftime('%Y-%m-%d %I:%M %p PHT')}\n"
-            f"Respawn timer: {respawn_hours} hours\n"
-            f"Use `!kill {boss_name}` after defeat"
-        )
-    else:
-        time_left = spawn_time - current_time
-        time_str = format_time_left(time_left)
-
-        await ctx.send(
-            f"**{display_name}**\n"
-            f"📍 **Location:** {location}\n"
-            f"Status: ❌ **DEAD**\n"
-            f"Killed at: {kill_time.strftime('%Y-%m-%d %I:%M %p PHT')}\n"
-            f"Respawns: {spawn_time.strftime('%Y-%m-%d %I:%M %p PHT')}\n"
-            f"Time left: {time_str}\n"
-            f"Respawn timer: {respawn_hours} hours"
-        )
-
-async def send_fixed_boss_status(ctx, boss_name):
-    """Send detailed status for a fixed-time boss"""
-    display_name = ' '.join(word.capitalize() for word in boss_name.split())
-    boss_info = FIXED_BOSSES[boss_name]
-    location = boss_info["location"]
-
-    next_spawn = get_next_spawn_time(boss_name)
-    current_time = get_ph_time()
-
-    if next_spawn:
-        time_left = next_spawn - current_time
-
-        if time_left.total_seconds() <= 0:
-            status_message = (
-                f"**{display_name}**\n"
-                f"📍 **Location:** {location}\n"
-                f"Status: ✅ **ALIVE**\n"
-                f"Next spawn: Calculating..."
-            )
+        
+        # Add info about top spawns if there are dead bosses
+        if dead_bosses:
+            top_count = min(5, len(dead_bosses))
+            message += f"\n🔥 **Top {top_count} next spawns**"
         else:
-            time_str = format_time_left(time_left)
-            status_message = (
-                f"**{display_name}**\n"
-                f"📍 **Location:** {location}\n"
-                f"Status: ❌ **DEAD**\n"
-                f"Next spawn: {next_spawn.strftime('%Y-%m-%d %I:%M %p PHT')}\n"
-                f"Time left: {time_str}\n"
-                f"**Spawn schedule:**\n"
-            )
-
-            # Add all spawn times
-            for spawn_info in boss_info["spawn_times"]:
-                status_message += f"• {spawn_info['day'].capitalize()} at {spawn_info['time']}\n"
-    else:
-        status_message = f"**{display_name}**\n📍 **Location:** {location}\nStatus: ❓ Unable to calculate next spawn"
-
-    await ctx.send(status_message)
+            message += f"\n✅ **All bosses are currently alive!**"
+        
+        await ctx.send(message)
 
 @bot.command(name='bosses', help='List all available bosses with locations')
 async def list_bosses(ctx):

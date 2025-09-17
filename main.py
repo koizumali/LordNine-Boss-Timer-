@@ -362,7 +362,7 @@ async def report_kill_manual(ctx, boss_name, *, time_input):
 @bot.command(name='status', help='Check status of all bosses or a specific boss. Example: !status or !status Amentis')
 async def check_status(ctx, *, specific_boss=None):
     if specific_boss:
-        # Show status for one specific boss
+        # Show status for one specific boss - SINGLE MESSAGE
         boss_name_lower = specific_boss.lower()
         if boss_name_lower not in ALL_BOSSES:
             await ctx.send(f"❌ Unknown boss `{specific_boss}`")
@@ -382,7 +382,7 @@ async def check_status(ctx, *, specific_boss=None):
 
         await send_boss_status(ctx, boss_name_lower, boss_info)
     else:
-        # Show status for all bosses - SORTED BY SPAWN TIME
+        # Show status for all bosses - SORTED BY SPAWN TIME - SINGLE MESSAGE
         current_time = get_ph_time()
         boss_statuses = []
 
@@ -436,7 +436,7 @@ async def check_status(ctx, *, specific_boss=None):
 
         boss_statuses.sort(key=sort_key)
 
-        # Create the status message
+        # Create the status message - ALL IN ONE TABLE
         message = "**BOSS STATUS** (Sorted by spawn time)\n"
         message += "```\n"
         message += "BOSS NAME           STATUS        TIME LEFT\n"
@@ -445,7 +445,7 @@ async def check_status(ctx, *, specific_boss=None):
         # Count dead bosses for highlighting
         dead_bosses = [boss for boss in boss_statuses if boss['status'] == "❌ DEAD"]
         
-        for i, boss in enumerate(boss_statuses):
+        for boss in boss_statuses:
             # Format time left
             if boss['status'] == "✅ ALIVE":
                 time_str = "-".ljust(12)
@@ -457,23 +457,12 @@ async def check_status(ctx, *, specific_boss=None):
             name_display = boss['name'].ljust(18)
             
             # Highlight top 5 dead bosses that will spawn soonest
-            if boss['status'] == "❌ DEAD":
-                boss_index_in_dead = dead_bosses.index(boss)
-                if boss_index_in_dead < 5:
-                    message += f"🔥 {name_display} {boss['status'].ljust(12)} {time_str}\n"
-                else:
-                    message += f"   {name_display} {boss['status'].ljust(12)} {time_str}\n"
+            if boss['status'] == "❌ DEAD" and dead_bosses.index(boss) < 5:
+                message += f"🔥 {name_display} {boss['status'].ljust(12)} {time_str}\n"
             else:
                 message += f"   {name_display} {boss['status'].ljust(12)} {time_str}\n"
 
         message += "```"
-        
-        # Add info about top spawns if there are dead bosses
-        if dead_bosses:
-            top_count = min(5, len(dead_bosses))
-            message += f"\n🔥 **Top {top_count} next spawns**"
-        else:
-            message += f"\n✅ **All bosses are currently alive!**"
         
         await ctx.send(message)
 

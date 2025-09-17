@@ -509,29 +509,116 @@ async def send_fixed_boss_status(ctx, boss_name):
 
     await ctx.send(status_message)
 
-@bot.command(name='bosses', help='List all available bosses with locations')
-async def list_bosses(ctx):
-    message = "**AVAILABLE BOSSES**\n"
-    message += "```\n"
-    message += "BOSS NAME           TYPE         LOCATION\n"
-    message += "───────────────────────────────────────────────────\n"
+@bot.command(name='status', help='Check status of all bosses or a specific boss. Example: !status or !status Amentis')
+async def check_status(ctx, *, specific_boss=None):
+    if specific_boss:
+        # Show status for one specific boss
+        boss_name_lower = specific_boss.lower()
+        if boss_name_lower not in ALL_BOSSES:
+            await ctx.send(f"❌ Unknown boss `{specific_boss}`")
+            return
 
-    for boss_name, boss_info in sorted(ALL_BOSSES.items()):
-        display_name = ' '.join(word.capitalize() for word in boss_name.split())
-        name_display = display_name.ljust(18)
+        # Handle fixed-time bosses differently
+        if boss_name_lower in FIXED_BOSSES:
+            await send_fixed_boss_status(ctx, boss_name_lower)
+            return
 
-        # Determine boss type
-        if boss_name in FIXED_BOSSES:
-            type_display = "FIXED-TIME".ljust(12)
-        else:
-            type_display = f"{boss_info['hours']}H".ljust(12)
+        boss_info = boss_data.get(boss_name_lower)
+        if not boss_info:
+            display_name = ' '.join(word.capitalize() for word in boss_name_lower.split())
+            location = REGULAR_BOSSES[boss_name_lower]["location"]
+            await ctx.send(f"**{display_name}**\n📍 **Location:** {location}\nStatus: ❓ Not killed yet")
+            return
 
-        location_display = boss_info["location"][:25]  # Trim long location names
-        message += f"{name_display} {type_display} {location_display}\n"
+        await send_boss_status(ctx, boss_name_lower, boss_info)
+    else:
+        # Show status for all bosses
+        current_time = get_ph_time()
+        
+        # Collect all boss statuses and calculate next spawn times
+        boss_statuses = []
+        
+        for boss_name in ALL_BOSSES.keys():
+            # Handle fixed-time bosses
+            if boss_name in FIXED_BOSSES:
+                next_spawn = get_next_spawn_time(boss_name)
+                if next_spawn:
+                    time_left = next_spawn - current_time
+                    if time_left.total_seconds() <= 0:
+                        status = "✅ ALIVE"
+                        time_left_value = timedelta(0)  # Already spawned
+                    else:
+                        status = "❌ DEAD"
+                        time_left_value = time_left
+                else:
+                    status = "❓ UNKNOWN"
+                    time_left_value = timedelta(days=365)  # Far in the future if unknown
+                
+                display_name = ' '.join(word.capitalize() for word in boss_name.split())
+                boss_statuses.append({
+                    "name": display_name,
+                    "status": status,
+                    "time_left": time_left_value,
+                    "is_fixed": True
+                })
+            else:
+                # Regular bosses
+                boss_info = boss_data.get(boss_name)
+                if boss_info:
+                    spawn_time = boss_info["spawn_time"]
+                    if current_time > spawn_time:
+                        status = "✅ ALIVE"
+                        time_left_value = timedelta(0)  # Already spawned
+                    else:
+                        status = "❌ DEAD"
+                        time_left_value = spawn_time - current_time
+                else:
+                    status = "❓ NOT KILLED"
+                    time_left_value = timedelta(days=365)  # Far in the future if not killed
+                
+                display_name = ' '.join(word.capitalize() for word in boss_name.split())
+                boss_statuses.append({
+                    "name": display_name,
+                    "status": status,
+                    "time_left": time_left_value,
+                    "is_fixed": False
+                })
+        
+        # Sort by time left (soonest first)
+        boss_statuses.sort(key=lambda x: x["time_left"])
+        
+        # Create the status message
+        message = "**BOSS STATUS**\n"
+        message += "```\n"
+        message += "BOSS NAME           STATUS        TIME LEFT\n"
+        message += "───────────────────────────────────────────\n"
+        
+        # Add top 5 soonest spawns with highlighting
+        message += "--- NEXT 5 TO SPAWN ---\n"
+        for i, boss in enumerate(boss_statuses[:5]):
+            if boss["status"] == "✅ ALIVE":
+                time_str = "-"
+            else:
+                time_str = format_time_left(boss["time_left"]).ljust(12)
+            
+            # Highlight the top 5 with a marker
+            marker = "➤ " if i == 0 else "  "
+            name_display = (marker + boss["name"]).ljust(20)
+            message += f"{name_display} {boss['status'].ljust(12)} {time_str}\n"
+        
+        message += "--- ALL BOSSES ---\n"
+        # Add the rest of the bosses
+        for boss in boss_statuses[5:]:
+            if boss["status"] == "✅ ALIVE":
+                time_str = "-"
+            else:
+                time_str = format_time_left(boss["time_left"]).ljust(12)
+            
+            name_display = boss["name"].ljust(20)
+            message += f"{name_display} {boss['status'].ljust(12)} {time_str}\n"
 
-    message += "```\n"
-    message += "**Legend:**\n• H = Hours respawn timer\n• FIXED-TIME = Spawns at specific times"
-    await ctx.send(message)
+        message += "```"
+        await ctx.send(message)
 
 @bot.command(name='schedule', help='Get spawn schedule for a fixed-time boss. Example: !schedule Clemantis')
 async def get_schedule(ctx, *, boss_name):

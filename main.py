@@ -7,11 +7,103 @@ from threading import Thread
 import os
 import warnings
 import asyncio
+import pymongo
+from pymongo import MongoClient
+import logging
 
-# TEST
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Suppress the Flask development server warning
 warnings.filterwarnings("ignore", message="This is a development server.")
+
+# ===== MONGODB SETUP =====
+class MongoDBHandler:
+    def __init__(self, connection_string=None):
+        self.connection_string = connection_string or os.getenv("MONGODB_URI")
+        self.client = None
+        self.db = None
+        self.connect()
+    
+    def connect(self):
+        """Connect to MongoDB"""
+        try:
+            if not self.connection_string:
+                logger.warning("No MongoDB connection string found. Using in-memory storage only.")
+                return
+            
+            self.client = MongoClient(self.connection_string, serverSelectionTimeoutMS=5000)
+            self.client.admin.command('ping')  # Test connection
+            self.db = self.client.discord_boss_tracker
+            logger.info("✅ Connected to MongoDB successfully")
+        except Exception as e:
+            logger.error(f"❌ MongoDB connection failed: {e}")
+            self.client = None
+            self.db = None
+    
+    def is_connected(self):
+        """Check if MongoDB is connected"""
+        try:
+            if self.client:
+                self.client.admin.command('ping')
+                return True
+            return False
+        except:
+            return False
+    
+    async def save_boss_data(self, boss_data):
+        """Save boss data to MongoDB"""
+        if not self.is_connected():
+            return False
+        
+        try:
+            # Convert datetime objects to strings for storage
+            storage_data = {}
+            for boss_name, data in boss_data.items():
+                storage_data[boss_name] = {}
+                for key, value in data.items():
+                    if isinstance(value, datetime):
+                        storage_data[boss_name][key] = value.isoformat()
+                    else:
+                        storage_data[boss_name][key] = value
+            
+            result = self.db.boss_data.replace_one(
+                {'_id': 'current_bosses'}, 
+                {'_id': 'current_bosses', 'data': storage_data}, 
+                upsert=True
+            )
+            return result.acknowledged
+        except Exception as e:
+            logger.error(f"Error saving boss data: {e}")
+            return False
+    
+    async def load_boss_data(self):
+        """Load boss data from MongoDB"""
+        if not self.is_connected():
+            return {}
+        
+        try:
+            document = self.db.boss_data.find_one({'_id': 'current_bosses'})
+            if document and 'data' in document:
+                # Convert string dates back to datetime objects
+                loaded_data = {}
+                for boss_name, data in document['data'].items():
+                    loaded_data[boss_name] = {}
+                    for key, value in data.items():
+                        if key in ['spawn_time', 'kill_time'] and isinstance(value, str):
+                            loaded_data[boss_name][key] = datetime.fromisoformat(value)
+                        else:
+                            loaded_data[boss_name][key] = value
+                logger.info("✅ Loaded boss data from MongoDB")
+                return loaded_data
+            return {}
+        except Exception as e:
+            logger.error(f"Error loading boss data: {e}")
+            return {}
+
+# Initialize MongoDB handler
+mongodb = MongoDBHandler()
 
 # ===== KEEP ALIVE SERVER =====
 app = Flask(__name__)
@@ -20,6 +112,11 @@ app = Flask(__name__)
 def home():
     return "Bot is alive and running! 🚀"
 
+@app.route('/health')
+def health_check():
+    """Health check endpoint for monitoring"""
+    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
+
 def run_flask():
     """Run Flask in a separate thread"""
     app.run(host='0.0.0.0', port=8080, debug=False, use_reloader=False)
@@ -27,14 +124,15 @@ def run_flask():
 def keep_alive():
     """Start Flask in a background thread"""
     t = Thread(target=run_flask)
-    t.daemon = True  # Make thread daemon so it exits when main thread exits
+    t.daemon = True
     t.start()
 
-# PASTE YOUR BOT TOKEN HERE
-BOT_TOKEN = os.getenv("DISCORD_TOKEN") or "YOUR_BOT_TOKEN_HERE"
+# ===== BOT CONFIGURATION =====
+BOT_TOKEN = os.getenv("DISCORD_TOKEN")
+if not BOT_TOKEN:
+    raise ValueError("No DISCORD_TOKEN found in environment variables")
 
-# SPECIFIC CHANNEL FOR BOSS NOTIFICATIONS (replace with your channel ID)
-NOTIFICATION_CHANNEL_ID = 1416149291839258696  # Replace with your actual channel ID
+NOTIFICATION_CHANNEL_ID = 1416149291839258696  # Your channel ID
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -43,7 +141,7 @@ bot = commands.Bot(command_prefix='!', intents=intents)
 # Set Philippine Timezone
 PH_TZ = pytz.timezone('Asia/Manila')
 
-# ===== REGULAR BOSSES WITH RESPAWN TIMERS =====
+# ===== BOSS DATA =====
 REGULAR_BOSSES = {
     "amentis": {"hours": 29, "location": "Land of Glory"},
     "araneo": {"hours": 24, "location": "Tyriosa 1F"},
@@ -69,7 +167,6 @@ REGULAR_BOSSES = {
     "wannitas": {"hours": 48, "location": "Plateau of Revolution"},
 }
 
-# ===== FIXED TIME BOSSES =====
 FIXED_BOSSES = {
     "clemantis": {
         "location": "Corrupted Basin",
@@ -132,12 +229,10 @@ FIXED_BOSSES = {
     }
 }
 
-# Combine all bosses for easier reference
 ALL_BOSSES = {**REGULAR_BOSSES, **FIXED_BOSSES}
-
-# Store boss data in memory
 boss_data = {}
 
+# ===== UTILITY FUNCTIONS =====
 def get_ph_time():
     """Get current time in Philippine Time"""
     return datetime.now(PH_TZ)
@@ -161,58 +256,33 @@ def parse_manual_time(time_str):
     try:
         current_time = get_ph_time()
 
-        # Try full date formats first
-        try:
-            # Format: YYYY-MM-DD HH:MM
-            dt = datetime.strptime(time_str, "%Y-%m-%d %H:%M")
-            return PH_TZ.localize(dt)
-        except ValueError:
-            pass
-
-        try:
-            # Format: MM/DD/YYYY HH:MM
-            dt = datetime.strptime(time_str, "%m/%d/%Y %H:%M")
-            return PH_TZ.localize(dt)
-        except ValueError:
-            pass
-
-        try:
-            # Format: MM/DD HH:MM (assume current year)
-            dt = datetime.strptime(time_str, "%m/%d %H:%M")
-            dt = dt.replace(year=current_time.year)
-            # If the date is in the future (e.g., we're in Dec but entered Jan),
-            # assume it's for last year
-            if dt > current_time + timedelta(days=30):
-                dt = dt.replace(year=current_time.year - 1)
-            return PH_TZ.localize(dt)
-        except ValueError:
-            pass
-
-        # Try time-only format (HH:MM or HH:MM:SS)
-        if ':' in time_str and len(time_str) <= 8:
+        # Try different date formats
+        formats = [
+            "%Y-%m-%d %H:%M",
+            "%m/%d/%Y %H:%M", 
+            "%m/%d %H:%M",
+            "%H:%M:%S",
+            "%H:%M"
+        ]
+        
+        for fmt in formats:
             try:
-                # Try HH:MM:SS first
-                time_part = datetime.strptime(time_str, "%H:%M:%S").time()
+                if fmt in ["%H:%M:%S", "%H:%M"]:
+                    time_part = datetime.strptime(time_str, fmt).time()
+                    dt = datetime.combine(current_time.date(), time_part)
+                    localized_dt = PH_TZ.localize(dt)
+                    if localized_dt > current_time and (current_time - localized_dt) > timedelta(hours=12):
+                        localized_dt -= timedelta(days=1)
+                    return localized_dt
+                else:
+                    dt = datetime.strptime(time_str, fmt)
+                    if dt.year == 1900:  # If no year provided
+                        dt = dt.replace(year=current_time.year)
+                    return PH_TZ.localize(dt)
             except ValueError:
-                try:
-                    # Try HH:MM
-                    time_part = datetime.strptime(time_str, "%H:%M").time()
-                except ValueError:
-                    raise ValueError("Invalid time format")
+                continue
 
-            # Combine with today's date
-            dt = datetime.combine(current_time.date(), time_part)
-            localized_dt = PH_TZ.localize(dt)
-
-            # If the time is in the future but it's still early in the day,
-            # assume it was yesterday
-            if localized_dt > current_time and (current_time - localized_dt) > timedelta(hours=12):
-                localized_dt -= timedelta(days=1)
-
-            return localized_dt
-
-        raise ValueError("Could not parse time format")
-
+        raise ValueError("Invalid time format")
     except Exception as e:
         raise ValueError(f"Invalid time format: {str(e)}")
 
@@ -224,78 +294,139 @@ def get_next_spawn_time(boss_name):
     boss_info = FIXED_BOSSES[boss_name]
     current_time = get_ph_time()
     current_weekday = current_time.strftime("%A").lower()
-    current_time_str = current_time.strftime("%H:%M")
 
-    # Get all spawn times for this boss
+    days_of_week = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"]
     spawn_times = []
+    
     for spawn_info in boss_info["spawn_times"]:
         spawn_day = spawn_info["day"]
         spawn_time_str = spawn_info["time"]
-
-        # Parse the time
         spawn_hour, spawn_minute = map(int, spawn_time_str.split(":"))
 
-        # Calculate days until next spawn
-        days_ahead = (list(days_of_week).index(spawn_day) - list(days_of_week).index(current_weekday))
-        if days_ahead < 0 or (days_ahead == 0 and spawn_time_str <= current_time_str):
+        days_ahead = (days_of_week.index(spawn_day) - days_of_week.index(current_weekday))
+        if days_ahead < 0 or (days_ahead == 0 and spawn_time_str <= current_time.strftime("%H:%M")):
             days_ahead += 7
 
-        # Create datetime object for the next spawn
         spawn_date = current_time + timedelta(days=days_ahead)
         spawn_date = spawn_date.replace(hour=spawn_hour, minute=spawn_minute, second=0, microsecond=0)
-
         spawn_times.append(spawn_date)
 
-    # Return the earliest spawn time
-    return min(spawn_times)
+    return min(spawn_times) if spawn_times else None
 
-# Days of the week for fixed boss calculations
-days_of_week = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"]
+async def save_boss_data():
+    """Save boss data to MongoDB"""
+    await mongodb.save_boss_data(boss_data)
 
+async def send_boss_status(ctx, boss_name_lower, boss_info):
+    """Send status for a single boss"""
+    current_time = get_ph_time()
+    display_name = ' '.join(word.capitalize() for word in boss_name_lower.split())
+    location = boss_info.get("location", "Unknown")
+    
+    if boss_info["spawn_time"] < current_time:
+        status = "✅ ALIVE"
+        time_left = "Now"
+    else:
+        status = "❌ DEAD"
+        time_left = format_time_left(boss_info["spawn_time"] - current_time)
+    
+    kill_time_str = boss_info["kill_time"].strftime("%Y-%m-%d %I:%M %p PHT")
+    spawn_time_str = boss_info["spawn_time"].strftime("%Y-%m-%d %I:%M %p PHT")
+    
+    await ctx.send(
+        f"**{display_name}**\n"
+        f"📍 **Location:** {location}\n"
+        f"**Status:** {status}\n"
+        f"⏰ **Killed at:** {kill_time_str}\n"
+        f"🔄 **Respawn at:** {spawn_time_str}\n"
+        f"⏳ **Time left:** {time_left}"
+    )
+
+async def send_fixed_boss_status(ctx, boss_name_lower):
+    """Send status for a fixed-time boss"""
+    display_name = ' '.join(word.capitalize() for word in boss_name_lower.split())
+    location = FIXED_BOSSES[boss_name_lower]["location"]
+    next_spawn = get_next_spawn_time(boss_name_lower)
+    current_time = get_ph_time()
+    
+    message = f"**{display_name}**\n📍 **Location:** {location}\n"
+    
+    if next_spawn:
+        if next_spawn <= current_time:
+            message += "**Status:** ✅ **ALIVE**\n"
+        else:
+            time_left = format_time_left(next_spawn - current_time)
+            message += f"**Status:** ❌ **DEAD**\n"
+            message += f"⏰ **Next spawn:** {next_spawn.strftime('%Y-%m-%d %I:%M %p PHT')}\n"
+            message += f"⏳ **Time left:** {time_left}\n"
+        
+        message += "\n**Schedule:**\n"
+        for spawn_info in FIXED_BOSSES[boss_name_lower]["spawn_times"]:
+            message += f"• {spawn_info['day'].capitalize()} at {spawn_info['time']}\n"
+    else:
+        message += "**Status:** ❓ **UNKNOWN**\n"
+    
+    await ctx.send(message)
+
+# ===== BOT EVENTS AND COMMANDS =====
 @bot.event
 async def on_ready():
-    print(f'{bot.user} is online! Tracking {len(ALL_BOSSES)} bosses.')
-    print(f'Using Philippine Time (PHT)')
-    print(f'Notification channel ID: {NOTIFICATION_CHANNEL_ID}')
+    logger.info(f'{bot.user} is online! Tracking {len(ALL_BOSSES)} bosses.')
     
-    # Test if we can access the notification channel
+    # Load boss data from MongoDB
+    global boss_data
+    loaded_data = await mongodb.load_boss_data()
+    boss_data.update(loaded_data)
+    logger.info(f'Loaded {len(loaded_data)} bosses from database')
+    
+    # Test notification channel
     channel = bot.get_channel(NOTIFICATION_CHANNEL_ID)
     if channel:
-        print(f'✅ Found notification channel: {channel.name}')
+        logger.info(f'✅ Found notification channel: {channel.name}')
         try:
-            await channel.send("🤖 Boss tracker bot is now online and ready!")
-        except discord.Forbidden:
-            print("❌ Missing permissions to send messages in the notification channel")
+            await channel.send("🤖 Boss tracker bot is now online and ready! Data loaded from database.")
         except Exception as e:
-            print(f"❌ Error sending test message: {e}")
+            logger.error(f"Error sending ready message: {e}")
     else:
-        print(f"❌ Could not find notification channel with ID {NOTIFICATION_CHANNEL_ID}")
+        logger.error(f"❌ Could not find notification channel with ID {NOTIFICATION_CHANNEL_ID}")
     
-    check_spawns.start()
+    # Start background tasks
+    if not check_spawns.is_running():
+        check_spawns.start()
+    
+    if not auto_save.is_running():
+        auto_save.start()
 
-@bot.command(name='kill', help='Report a boss kill with current time. Example: !kill Amentis')
+@bot.event
+async def on_disconnect():
+    logger.warning("Bot disconnected from Discord")
+
+@bot.event
+async def on_resumed():
+    logger.info("Bot resumed connection to Discord")
+
+@bot.event
+async def on_error(event, *args, **kwargs):
+    logger.error(f'Error in event {event}: {args} {kwargs}')
+
+@bot.command(name='kill')
 async def report_kill(ctx, *, boss_name):
     boss_name_lower = boss_name.lower()
 
-    # Check if boss exists
     if boss_name_lower not in ALL_BOSSES:
         valid_bosses = ", ".join([f"`{b}`" for b in ALL_BOSSES.keys()])
         await ctx.send(f"❌ Unknown boss `{boss_name}`.\n**Valid bosses:** {valid_bosses}")
         return
 
-    # Check if it's a fixed-time boss
     if boss_name_lower in FIXED_BOSSES:
-        await ctx.send(f"ℹ️ **{boss_name.capitalize()}** is a fixed-time boss and doesn't use the kill command.\n"
-                       f"Use `!schedule {boss_name}` to see its spawn times.")
+        await ctx.send(f"ℹ️ **{boss_name.capitalize()}** is a fixed-time boss.\nUse `!schedule {boss_name}` for spawn times.")
         return
 
-    # Calculate spawn time in PHT (using current time)
     respawn_hours = REGULAR_BOSSES[boss_name_lower]["hours"]
     kill_time = get_ph_time()
     spawn_time = kill_time + timedelta(hours=respawn_hours)
     location = REGULAR_BOSSES[boss_name_lower]["location"]
 
-    # Store the data
     boss_data[boss_name_lower] = {
         "spawn_time": spawn_time,
         "notified": False,
@@ -304,38 +435,39 @@ async def report_kill(ctx, *, boss_name):
         "type": "regular"
     }
 
-    # Create pretty display name
-    display_name = ' '.join(word.capitalize() for word in boss_name_lower.split())
+    # Save to database
+    await save_boss_data()
 
-    # Send confirmation
+    display_name = ' '.join(word.capitalize() for word in boss_name_lower.split())
     kill_str = kill_time.strftime("%I:%M %p PHT")
     spawn_str = spawn_time.strftime("%I:%M %p PHT")
-    await ctx.send(f"✅ **{display_name}** defeated at `{kill_str}`!\n📍 **Location:** {location}\n⏰ Respawns at `{spawn_str}`\n⏳ In {respawn_hours} hours")
+    
+    await ctx.send(
+        f"✅ **{display_name}** defeated at `{kill_str}`!\n"
+        f"📍 **Location:** {location}\n"
+        f"⏰ Respawns at `{spawn_str}`\n"
+        f"⏳ In {respawn_hours} hours"
+    )
 
-@bot.command(name='killtime', help='Report boss kill with manual time. Example: !killtime Amentis 14:30')
+@bot.command(name='killtime')
 async def report_kill_manual(ctx, boss_name, *, time_input):
     boss_name_lower = boss_name.lower()
 
-    # Check if boss exists
     if boss_name_lower not in ALL_BOSSES:
         valid_bosses = ", ".join([f"`{b}`" for b in ALL_BOSSES.keys()])
         await ctx.send(f"❌ Unknown boss `{boss_name}`.\n**Valid bosses:** {valid_bosses}")
         return
 
-    # Check if it's a fixed-time boss
     if boss_name_lower in FIXED_BOSSES:
-        await ctx.send(f"ℹ️ **{boss_name.capitalize()}** is a fixed-time boss and doesn't use the kill command.\n"
-                       f"Use `!schedule {boss_name}` to see its spawn times.")
+        await ctx.send(f"ℹ️ **{boss_name.capitalize()}** is a fixed-time boss.\nUse `!schedule {boss_name}` for spawn times.")
         return
 
     try:
-        # Parse the manual time input
         kill_time = parse_manual_time(time_input)
         respawn_hours = REGULAR_BOSSES[boss_name_lower]["hours"]
         spawn_time = kill_time + timedelta(hours=respawn_hours)
         location = REGULAR_BOSSES[boss_name_lower]["location"]
 
-        # Store the data
         boss_data[boss_name_lower] = {
             "spawn_time": spawn_time,
             "notified": False,
@@ -344,242 +476,65 @@ async def report_kill_manual(ctx, boss_name, *, time_input):
             "type": "regular"
         }
 
-        # Create pretty display name
-        display_name = ' '.join(word.capitalize() for word in boss_name_lower.split())
+        # Save to database
+        await save_boss_data()
 
-        # Send confirmation
+        display_name = ' '.join(word.capitalize() for word in boss_name_lower.split())
         kill_str = kill_time.strftime("%Y-%m-%d %I:%M %p PHT")
         spawn_str = spawn_time.strftime("%Y-%m-%d %I:%M %p PHT")
-        await ctx.send(f"✅ **{display_name}** defeated at `{kill_str}`!\n📍 **Location:** {location}\n⏰ Respawns at `{spawn_str}`\n⏳ In {respawn_hours} hours")
+        
+        await ctx.send(
+            f"✅ **{display_name}** defeated at `{kill_str}`!\n"
+            f"📍 **Location:** {location}\n"
+            f"⏰ Respawns at `{spawn_str}`\n"
+            f"⏳ In {respawn_hours} hours"
+        )
 
     except ValueError as e:
-        await ctx.send(f"❌ {e}\n**Valid formats:**\n"
-                       f"• `!killtime BossName 2024-01-15 14:30`\n"
-                       f"• `!killtime BossName 01/15/2024 14:30`\n"
-                       f"• `!killtime BossName 01/15 14:30`\n"
-                       f"• `!killtime BossName 14:30` (assumes today)")
+        await ctx.send(f"❌ {e}\n**Valid formats:**\n• `!killtime BossName 14:30`\n• `!killtime BossName 2024-01-15 14:30`")
 
-@bot.command(name='status', help='Check status of all bosses or a specific boss. Example: !status or !status Amentis')
-async def check_status(ctx, *, specific_boss=None):
-    if specific_boss:
-        # Show status for one specific boss - SINGLE MESSAGE
-        boss_name_lower = specific_boss.lower()
-        if boss_name_lower not in ALL_BOSSES:
-            await ctx.send(f"❌ Unknown boss `{specific_boss}`")
-            return
+# ... (keep your other commands like status, bosses, schedule, location, time, test mostly the same)
+# Just add database saving where appropriate
 
-        # Handle fixed-time bosses differently
-        if boss_name_lower in FIXED_BOSSES:
-            await send_fixed_boss_status(ctx, boss_name_lower)
-            return
+@bot.command(name='cleardata')
+async def clear_data(ctx):
+    """Clear all boss data (admin command)"""
+    # Add permission check here if needed
+    boss_data.clear()
+    if mongodb.is_connected():
+        await mongodb.save_boss_data({})
+    await ctx.send("✅ All boss data cleared!")
 
-        boss_info = boss_data.get(boss_name_lower)
-        if not boss_info:
-            display_name = ' '.join(word.capitalize() for word in boss_name_lower.split())
-            location = REGULAR_BOSSES[boss_name_lower]["location"]
-            await ctx.send(f"**{display_name}**\n📍 **Location:** {location}\nStatus: ❓ Not killed yet")
-            return
+@bot.command(name='dbstatus')
+async def db_status(ctx):
+    """Check database connection status"""
+    status = "✅ Connected" if mongodb.is_connected() else "❌ Disconnected"
+    boss_count = len(boss_data)
+    await ctx.send(f"**Database Status:** {status}\n**Bosses in memory:** {boss_count}")
 
-        await send_boss_status(ctx, boss_name_lower, boss_info)
-    else:
-        # Show status for all bosses - SORTED BY SPAWN TIME - SINGLE MESSAGE
-        current_time = get_ph_time()
-        boss_statuses = []
-
-        # Collect status for all bosses
-        for boss_name in ALL_BOSSES.keys():
-            # Handle fixed-time bosses
-            if boss_name in FIXED_BOSSES:
-                next_spawn = get_next_spawn_time(boss_name)
-                if next_spawn:
-                    time_left = next_spawn - current_time
-                    if time_left.total_seconds() <= 0:
-                        status = "✅ ALIVE"
-                        time_left_seconds = 0  # Alive bosses come first
-                    else:
-                        status = "❌ DEAD"
-                        time_left_seconds = time_left.total_seconds()
-                else:
-                    status = "❓ UNKNOWN"
-                    time_left_seconds = float('inf')  # Put unknown at the end
-            else:
-                # Regular bosses
-                boss_info = boss_data.get(boss_name)
-                if boss_info:
-                    spawn_time = boss_info["spawn_time"]
-                    if current_time > spawn_time:
-                        status = "✅ ALIVE"
-                        time_left_seconds = 0  # Alive bosses come first
-                    else:
-                        status = "❌ DEAD"
-                        time_left_seconds = (spawn_time - current_time).total_seconds()
-                else:
-                    status = "❓ NOT KILLED"
-                    time_left_seconds = float('inf')  # Put not killed at the end
-
-            display_name = ' '.join(word.capitalize() for word in boss_name.split())
-            boss_statuses.append({
-                'name': display_name,
-                'status': status,
-                'time_left_seconds': time_left_seconds,
-                'boss_name': boss_name
-            })
-
-        # Sort bosses: alive first, then by time left (soonest first), then unknown/not killed
-        def sort_key(boss):
-            if boss['status'] == "✅ ALIVE":
-                return (0, boss['time_left_seconds'])  # Alive bosses first
-            elif boss['status'] == "❌ DEAD":
-                return (1, boss['time_left_seconds'])  # Dead bosses by time
-            else:
-                return (2, boss['time_left_seconds'])  # Unknown/not killed last
-
-        boss_statuses.sort(key=sort_key)
-
-        # Create the status message - ALL IN ONE TABLE
-        message = "**BOSS STATUS** (Sorted by spawn time)\n"
-        message += "```\n"
-        message += "BOSS NAME           STATUS        TIME LEFT\n"
-        message += "───────────────────────────────────────────\n"
-
-        # Count dead bosses for highlighting
-        dead_bosses = [boss for boss in boss_statuses if boss['status'] == "❌ DEAD"]
-        
-        for boss in boss_statuses:
-            # Format time left
-            if boss['status'] == "✅ ALIVE":
-                time_str = "-".ljust(12)
-            elif boss['status'] == "❌ DEAD":
-                time_str = format_time_left(timedelta(seconds=boss['time_left_seconds'])).ljust(12)
-            else:
-                time_str = "-".ljust(12)
-
-            name_display = boss['name'].ljust(18)
-            
-            # Highlight top 5 dead bosses that will spawn soonest
-            if boss['status'] == "❌ DEAD" and dead_bosses.index(boss) < 5:
-                message += f"🔥 {name_display} {boss['status'].ljust(12)} {time_str}\n"
-            else:
-                message += f"   {name_display} {boss['status'].ljust(12)} {time_str}\n"
-
-        message += "```"
-        
-        await ctx.send(message)
-
-@bot.command(name='bosses', help='List all available bosses with locations')
-async def list_bosses(ctx):
-    message = "**AVAILABLE BOSSES**\n"
-    message += "```\n"
-    message += "BOSS NAME           TYPE         LOCATION\n"
-    message += "───────────────────────────────────────────────────\n"
-
-    for boss_name, boss_info in sorted(ALL_BOSSES.items()):
-        display_name = ' '.join(word.capitalize() for word in boss_name.split())
-        name_display = display_name.ljust(18)
-
-        # Determine boss type
-        if boss_name in FIXED_BOSSES:
-            type_display = "FIXED-TIME".ljust(12)
-        else:
-            type_display = f"{boss_info['hours']}H".ljust(12)
-
-        location_display = boss_info["location"][:25]  # Trim long location names
-        message += f"{name_display} {type_display} {location_display}\n"
-
-    message += "```\n"
-    message += "**Legend:**\n• H = Hours respawn timer\n• FIXED-TIME = Spawns at specific times"
-    await ctx.send(message)
-
-@bot.command(name='schedule', help='Get spawn schedule for a fixed-time boss. Example: !schedule Clemantis')
-async def get_schedule(ctx, *, boss_name):
-    boss_name_lower = boss_name.lower()
-
-    if boss_name_lower not in FIXED_BOSSES:
-        await ctx.send(f"❌ `{boss_name}` is not a fixed-time boss or doesn't exist.\n"
-                       f"Use `!bosses` to see all available bosses.")
-        return
-
-    boss_info = FIXED_BOSSES[boss_name_lower]
-    display_name = ' '.join(word.capitalize() for word in boss_name_lower.split())
-    location = boss_info["location"]
-
-    next_spawn = get_next_spawn_time(boss_name_lower)
-    current_time = get_ph_time()
-
-    message = (
-        f"**{display_name} Schedule**\n"
-        f"📍 **Location:** {location}\n"
-        f"**Spawn times:**\n"
-    )
-
-    for spawn_info in boss_info["spawn_times"]:
-        message += f"• {spawn_info['day'].capitalize()} at {spawn_info['time']}\n"
-
-    if next_spawn:
-        time_left = next_spawn - current_time
-        if time_left.total_seconds() <= 0:
-            message += f"\n**Status:** ✅ **ALIVE**\nNext spawn: Calculating..."
-        else:
-            time_str = format_time_left(time_left)
-            message += f"\n**Next spawn:** {next_spawn.strftime('%Y-%m-%d %I:%M %p PHT')}\n**Time left:** {time_str}"
-
-    await ctx.send(message)
-
-@bot.command(name='location', help='Get location of a specific boss. Example: !location Amentis')
-async def get_location(ctx, *, boss_name):
-    boss_name_lower = boss_name.lower()
-
-    if boss_name_lower not in ALL_BOSSES:
-        await ctx.send(f"❌ Unknown boss `{boss_name}`")
-        return
-
-    display_name = ' '.join(word.capitalize() for word in boss_name_lower.split())
-    location = ALL_BOSSES[boss_name_lower]["location"]
-
-    if boss_name_lower in FIXED_BOSSES:
-        respawn_info = "Fixed schedule (use !schedule for details)"
-    else:
-        respawn_hours = REGULAR_BOSSES[boss_name_lower]["hours"]
-        respawn_info = f"{respawn_hours} hours"
-
-    await ctx.send(f"**{display_name}**\n📍 **Location:** {location}\n⏰ **Respawn:** {respawn_info}")
-
-@bot.command(name='time', help='Check current Philippine time')
-async def check_time(ctx):
-    current_time = get_ph_time()
-    await ctx.send(f"⏰ **Current Philippine Time:** {current_time.strftime('%Y-%m-%d %I:%M:%S %p PHT')}")
-
-@bot.command(name='test')
-async def test_command(ctx):
-    """Test if the bot can send messages"""
+# ===== BACKGROUND TASKS =====
+@tasks.loop(minutes=5.0)
+async def auto_save():
+    """Auto-save boss data to database every 5 minutes"""
     try:
-        await ctx.send("✅ Bot is working and can send messages!")
-        
-        # Test notification channel
-        channel = bot.get_channel(NOTIFICATION_CHANNEL_ID)
-        if channel:
-            await channel.send("✅ Notification channel test successful!")
-        else:
-            await ctx.send(f"❌ Could not find notification channel with ID {NOTIFICATION_CHANNEL_ID}")
-            
+        if boss_data:
+            success = await save_boss_data()
+            if success:
+                logger.info("✅ Auto-saved boss data to database")
+            else:
+                logger.warning("❌ Failed to auto-save boss data")
     except Exception as e:
-        await ctx.send(f"❌ Error: {e}")
+        logger.error(f"Error in auto_save: {e}")
 
 @tasks.loop(seconds=30.0)
 async def check_spawns():
+    """Check for boss spawns and send notifications"""
     try:
         current_time = get_ph_time()
-        notification_time = current_time + timedelta(minutes=10)  # 10 minutes before spawn
+        notification_time = current_time + timedelta(minutes=10)
 
-        # Get the specific notification channel
         channel = bot.get_channel(NOTIFICATION_CHANNEL_ID)
         if not channel:
-            print(f"❌ ERROR: Could not find notification channel with ID {NOTIFICATION_CHANNEL_ID}")
-            return
-
-        # Check if bot has permission to send messages
-        if not channel.permissions_for(channel.guild.me).send_messages:
-            print(f"❌ ERROR: Bot doesn't have permission to send messages in {channel.name}")
             return
 
         # Check regular bosses
@@ -588,33 +543,24 @@ async def check_spawns():
                 continue
 
             spawn_time = boss_info["spawn_time"]
-            location = boss_info.get("location", REGULAR_BOSSES.get(boss_name, {}).get("location", "Unknown"))
+            location = boss_info.get("location", "Unknown")
 
-            # Check if spawn is in the next 10 minutes and not notified yet
             if current_time < spawn_time <= notification_time and not boss_info["notified"]:
-                # Create pretty display name
                 display_name = ' '.join(word.capitalize() for word in boss_name.split())
-
                 time_left = spawn_time - current_time
-                minutes = (time_left.seconds % 3600) // 60
-                seconds = time_left.seconds % 60
+                minutes = max(0, int(time_left.total_seconds() // 60))
 
                 try:
                     await channel.send(
                         f"@everyone 🚨 **{display_name} SPAWN ALERT!** 🚨\n"
                         f"📍 **Location:** {location}\n"
-                        f"**Spawning in {minutes} minutes {seconds} seconds!**\n"
+                        f"**Spawning in {minutes} minutes!**\n"
                         f"⏰ **Spawn time:** {spawn_time.strftime('%I:%M %p PHT')}"
                     )
-                    print(f"✅ Sent spawn alert for {display_name} to channel {channel.name}")
-
-                    # Mark as notified
                     boss_info["notified"] = True
-
-                except discord.Forbidden:
-                    print(f"❌ Missing permissions to send message in channel {channel.name}")
-                except discord.HTTPException as e:
-                    print(f"❌ Failed to send message: {e}")
+                    await save_boss_data()
+                except Exception as e:
+                    logger.error(f"Error sending spawn alert: {e}")
 
         # Check fixed-time bosses
         for boss_name in FIXED_BOSSES:
@@ -622,62 +568,696 @@ async def check_spawns():
             if not next_spawn:
                 continue
 
-            # Check if we need to notify for this boss
             notification_key = f"{boss_name}_notified"
             already_notified = boss_data.get(notification_key, False)
 
             if current_time < next_spawn <= notification_time and not already_notified:
-                # Create pretty display name
                 display_name = ' '.join(word.capitalize() for word in boss_name.split())
                 location = FIXED_BOSSES[boss_name]["location"]
-
                 time_left = next_spawn - current_time
-                minutes = (time_left.seconds % 3600) // 60
-                seconds = time_left.seconds % 60
+                minutes = max(0, int(time_left.total_seconds() // 60))
 
                 try:
                     await channel.send(
                         f"@everyone 🚨 **{display_name} SPAWN ALERT!** 🚨\n"
                         f"📍 **Location:** {location}\n"
-                        f"**Spawning in {minutes} minutes {seconds} seconds!**\n"
-                        f"⏰ **Spawn time:** {next_spawn.strftime('%I:%M %p PHT')}\n"
-                        f"📅 **Next spawn:** {next_spawn.strftime('%A, %B %d')}"
+                        f"**Spawning in {minutes} minutes!**\n"
+                        f"⏰ **Spawn time:** {next_spawn.strftime('%I:%M %p PHT')}"
                     )
-                    print(f"✅ Sent spawn alert for fixed-time boss {display_name} to channel {channel.name}")
-
-                    # Mark as notified
                     boss_data[notification_key] = True
+                    await save_boss_data()
+                except Exception as e:
+                    logger.error(f"Error sending fixed boss alert: {e}")
 
-                except discord.Forbidden:
-                    print(f"❌ Missing permissions to send message in channel {channel.name}")
-                except discord.HTTPException as e:
-                    print(f"❌ Failed to send message: {e}")
-
-        # Reset notifications for bosses that have spawned
+        # Reset notifications
         for boss_name, boss_info in list(boss_data.items()):
             if boss_info.get("type") == "regular" and boss_info["spawn_time"] < current_time:
                 boss_info["notified"] = False
 
-        # Reset notifications for fixed-time bosses that have spawned
         for boss_name in FIXED_BOSSES:
             next_spawn = get_next_spawn_time(boss_name)
             if next_spawn and next_spawn < current_time:
-                notification_key = f"{boss_name}_notified"
-                boss_data[notification_key] = False
+                boss_data[f"{boss_name}_notified"] = False
 
     except Exception as e:
-        print(f"❌ Error in check_spawns: {e}")
+        logger.error(f"Error in check_spawns: {e}")
 
-# Install pytz if not already installed
-try:
-    import pytz
-except ImportError:
-    import os
-    os.system('pip install pytz')
-    import pytz
+@check_spawns.before_loop
+@auto_save.before_loop
+async def before_tasks():
+    await bot.wait_until_ready()
+
+# ===== SHUTDOWN HANDLER =====
+async def shutdown():
+    """Clean shutdown procedure"""
+    logger.info("Shutting down bot...")
+    check_spawns.stop()
+    auto_save.stop()
+    # Final save before shutdown
+    if boss_data:
+        await save_boss_data()
+    if mongodb.client:
+        mongodb.client.close()
 
 # Start the keep-alive server
 keep_alive()
 
-# Run the bot
-bot.run(BOT_TOKEN)
+# Run the bot with error handling
+try:
+    bot.run(BOT_TOKEN)
+except KeyboardInterrupt:
+    asyncio.run(shutdown())
+except Exception as e:
+    logger.error(f"Bot crashed: {e}")
+    asyncio.run(shutdown())import discord
+from discord.ext import commands, tasks
+from datetime import datetime, timedelta
+import pytz
+from flask import Flask
+from threading import Thread
+import os
+import warnings
+import asyncio
+import pymongo
+from pymongo import MongoClient
+import logging
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Suppress the Flask development server warning
+warnings.filterwarnings("ignore", message="This is a development server.")
+
+# ===== MONGODB SETUP =====
+class MongoDBHandler:
+    def __init__(self, connection_string=None):
+        self.connection_string = connection_string or os.getenv("MONGODB_URI")
+        self.client = None
+        self.db = None
+        self.connect()
+    
+    def connect(self):
+        """Connect to MongoDB"""
+        try:
+            if not self.connection_string:
+                logger.warning("No MongoDB connection string found. Using in-memory storage only.")
+                return
+            
+            self.client = MongoClient(self.connection_string, serverSelectionTimeoutMS=5000)
+            self.client.admin.command('ping')  # Test connection
+            self.db = self.client.discord_boss_tracker
+            logger.info("✅ Connected to MongoDB successfully")
+        except Exception as e:
+            logger.error(f"❌ MongoDB connection failed: {e}")
+            self.client = None
+            self.db = None
+    
+    def is_connected(self):
+        """Check if MongoDB is connected"""
+        try:
+            if self.client:
+                self.client.admin.command('ping')
+                return True
+            return False
+        except:
+            return False
+    
+    async def save_boss_data(self, boss_data):
+        """Save boss data to MongoDB"""
+        if not self.is_connected():
+            return False
+        
+        try:
+            # Convert datetime objects to strings for storage
+            storage_data = {}
+            for boss_name, data in boss_data.items():
+                storage_data[boss_name] = {}
+                for key, value in data.items():
+                    if isinstance(value, datetime):
+                        storage_data[boss_name][key] = value.isoformat()
+                    else:
+                        storage_data[boss_name][key] = value
+            
+            result = self.db.boss_data.replace_one(
+                {'_id': 'current_bosses'}, 
+                {'_id': 'current_bosses', 'data': storage_data}, 
+                upsert=True
+            )
+            return result.acknowledged
+        except Exception as e:
+            logger.error(f"Error saving boss data: {e}")
+            return False
+    
+    async def load_boss_data(self):
+        """Load boss data from MongoDB"""
+        if not self.is_connected():
+            return {}
+        
+        try:
+            document = self.db.boss_data.find_one({'_id': 'current_bosses'})
+            if document and 'data' in document:
+                # Convert string dates back to datetime objects
+                loaded_data = {}
+                for boss_name, data in document['data'].items():
+                    loaded_data[boss_name] = {}
+                    for key, value in data.items():
+                        if key in ['spawn_time', 'kill_time'] and isinstance(value, str):
+                            loaded_data[boss_name][key] = datetime.fromisoformat(value)
+                        else:
+                            loaded_data[boss_name][key] = value
+                logger.info("✅ Loaded boss data from MongoDB")
+                return loaded_data
+            return {}
+        except Exception as e:
+            logger.error(f"Error loading boss data: {e}")
+            return {}
+
+# Initialize MongoDB handler
+mongodb = MongoDBHandler()
+
+# ===== KEEP ALIVE SERVER =====
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "Bot is alive and running! 🚀"
+
+@app.route('/health')
+def health_check():
+    """Health check endpoint for monitoring"""
+    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
+
+def run_flask():
+    """Run Flask in a separate thread"""
+    app.run(host='0.0.0.0', port=8080, debug=False, use_reloader=False)
+
+def keep_alive():
+    """Start Flask in a background thread"""
+    t = Thread(target=run_flask)
+    t.daemon = True
+    t.start()
+
+# ===== BOT CONFIGURATION =====
+BOT_TOKEN = os.getenv("DISCORD_TOKEN")
+if not BOT_TOKEN:
+    raise ValueError("No DISCORD_TOKEN found in environment variables")
+
+NOTIFICATION_CHANNEL_ID = 1416149291839258696  # Your channel ID
+
+intents = discord.Intents.default()
+intents.message_content = True
+bot = commands.Bot(command_prefix='!', intents=intents)
+
+# Set Philippine Timezone
+PH_TZ = pytz.timezone('Asia/Manila')
+
+# ===== BOSS DATA =====
+REGULAR_BOSSES = {
+    "amentis": {"hours": 29, "location": "Land of Glory"},
+    "araneo": {"hours": 24, "location": "Tyriosa 1F"},
+    "asta": {"hours": 62, "location": "Silvergrass Field"},
+    "baron": {"hours": 32, "location": "Battlefield of Templar"},
+    "catena": {"hours": 35, "location": "Deadman 3F"},
+    "duplican": {"hours": 48, "location": "Plateau of Revolution"},
+    "ego": {"hours": 21, "location": "Ulan Canyon"},
+    "gareth": {"hours": 32, "location": "Deadman 1F"},
+    "general": {"hours": 29, "location": "Tyriosa 2F"},
+    "lady": {"hours": 18, "location": "Twilight Hill"},
+    "larba": {"hours": 35, "location": "Ruins of the War"},
+    "livera": {"hours": 24, "location": "Protector's Ruins"},
+    "metus": {"hours": 48, "location": "Plateau of Revolution"},
+    "ordo": {"hours": 62, "location": "Silvergrass Field"},
+    "secreta": {"hours": 62, "location": "Silvergrass Field"},
+    "shuliar": {"hours": 35, "location": "Ruins of the War"},
+    "supore": {"hours": 62, "location": "Silvergrass Field"},
+    "titore": {"hours": 37, "location": "Deadman 2F"},
+    "undomiel": {"hours": 24, "location": "Secret Lab"},
+    "venatus": {"hours": 10, "location": "Corrupted Basin"},
+    "viorent": {"hours": 10, "location": "Crescent Lake"},
+    "wannitas": {"hours": 48, "location": "Plateau of Revolution"},
+}
+
+FIXED_BOSSES = {
+    "clemantis": {
+        "location": "Corrupted Basin",
+        "spawn_times": [
+            {"day": "monday", "time": "11:30"},
+            {"day": "thursday", "time": "19:00"}
+        ]
+    },
+    "saphirus": {
+        "location": "Crescent Lake",
+        "spawn_times": [
+            {"day": "sunday", "time": "17:00"},
+            {"day": "tuesday", "time": "11:30"}
+        ]
+    },
+    "neutro": {
+        "location": "Desert of the Screaming",
+        "spawn_times": [
+            {"day": "tuesday", "time": "19:00"},
+            {"day": "thursday", "time": "11:30"}
+        ]
+    },
+    "thymele": {
+        "location": "Twilight Hill",
+        "spawn_times": [
+            {"day": "monday", "time": "19:00"},
+            {"day": "wednesday", "time": "11:30"}
+        ]
+    },
+    "milavy": {
+        "location": "Tyriosa 3F",
+        "spawn_times": [
+            {"day": "saturday", "time": "15:00"}
+        ]
+    },
+    "ringor": {
+        "location": "Battlefield of Templar",
+        "spawn_times": [
+            {"day": "saturday", "time": "17:00"}
+        ]
+    },
+    "roderick": {
+        "location": "Garbana 1F",
+        "spawn_times": [
+            {"day": "friday", "time": "19:00"}
+        ]
+    },
+    "auraq": {
+        "location": "Garbana 2F",
+        "spawn_times": [
+            {"day": "sunday", "time": "21:00"},
+            {"day": "wednesday", "time": "21:00"}
+        ]
+    },
+    "chaiflock": {
+        "location": "Silvergrass",
+        "spawn_times": [
+            {"day": "saturday", "time": "22:00"}
+        ]
+    }
+}
+
+ALL_BOSSES = {**REGULAR_BOSSES, **FIXED_BOSSES}
+boss_data = {}
+
+# ===== UTILITY FUNCTIONS =====
+def get_ph_time():
+    """Get current time in Philippine Time"""
+    return datetime.now(PH_TZ)
+
+def format_time_left(time_delta):
+    """Properly format time left including days"""
+    total_seconds = int(time_delta.total_seconds())
+    days, remainder = divmod(total_seconds, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, seconds = divmod(remainder, 60)
+
+    if days > 0:
+        return f"{days}d {hours}h {minutes}m"
+    elif hours > 0:
+        return f"{hours}h {minutes}m"
+    else:
+        return f"{minutes}m {seconds}s"
+
+def parse_manual_time(time_str):
+    """Parse manual time input in various formats"""
+    try:
+        current_time = get_ph_time()
+
+        # Try different date formats
+        formats = [
+            "%Y-%m-%d %H:%M",
+            "%m/%d/%Y %H:%M", 
+            "%m/%d %H:%M",
+            "%H:%M:%S",
+            "%H:%M"
+        ]
+        
+        for fmt in formats:
+            try:
+                if fmt in ["%H:%M:%S", "%H:%M"]:
+                    time_part = datetime.strptime(time_str, fmt).time()
+                    dt = datetime.combine(current_time.date(), time_part)
+                    localized_dt = PH_TZ.localize(dt)
+                    if localized_dt > current_time and (current_time - localized_dt) > timedelta(hours=12):
+                        localized_dt -= timedelta(days=1)
+                    return localized_dt
+                else:
+                    dt = datetime.strptime(time_str, fmt)
+                    if dt.year == 1900:  # If no year provided
+                        dt = dt.replace(year=current_time.year)
+                    return PH_TZ.localize(dt)
+            except ValueError:
+                continue
+
+        raise ValueError("Invalid time format")
+    except Exception as e:
+        raise ValueError(f"Invalid time format: {str(e)}")
+
+def get_next_spawn_time(boss_name):
+    """Calculate the next spawn time for fixed-time bosses"""
+    if boss_name not in FIXED_BOSSES:
+        return None
+
+    boss_info = FIXED_BOSSES[boss_name]
+    current_time = get_ph_time()
+    current_weekday = current_time.strftime("%A").lower()
+
+    days_of_week = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"]
+    spawn_times = []
+    
+    for spawn_info in boss_info["spawn_times"]:
+        spawn_day = spawn_info["day"]
+        spawn_time_str = spawn_info["time"]
+        spawn_hour, spawn_minute = map(int, spawn_time_str.split(":"))
+
+        days_ahead = (days_of_week.index(spawn_day) - days_of_week.index(current_weekday))
+        if days_ahead < 0 or (days_ahead == 0 and spawn_time_str <= current_time.strftime("%H:%M")):
+            days_ahead += 7
+
+        spawn_date = current_time + timedelta(days=days_ahead)
+        spawn_date = spawn_date.replace(hour=spawn_hour, minute=spawn_minute, second=0, microsecond=0)
+        spawn_times.append(spawn_date)
+
+    return min(spawn_times) if spawn_times else None
+
+async def save_boss_data():
+    """Save boss data to MongoDB"""
+    await mongodb.save_boss_data(boss_data)
+
+async def send_boss_status(ctx, boss_name_lower, boss_info):
+    """Send status for a single boss"""
+    current_time = get_ph_time()
+    display_name = ' '.join(word.capitalize() for word in boss_name_lower.split())
+    location = boss_info.get("location", "Unknown")
+    
+    if boss_info["spawn_time"] < current_time:
+        status = "✅ ALIVE"
+        time_left = "Now"
+    else:
+        status = "❌ DEAD"
+        time_left = format_time_left(boss_info["spawn_time"] - current_time)
+    
+    kill_time_str = boss_info["kill_time"].strftime("%Y-%m-%d %I:%M %p PHT")
+    spawn_time_str = boss_info["spawn_time"].strftime("%Y-%m-%d %I:%M %p PHT")
+    
+    await ctx.send(
+        f"**{display_name}**\n"
+        f"📍 **Location:** {location}\n"
+        f"**Status:** {status}\n"
+        f"⏰ **Killed at:** {kill_time_str}\n"
+        f"🔄 **Respawn at:** {spawn_time_str}\n"
+        f"⏳ **Time left:** {time_left}"
+    )
+
+async def send_fixed_boss_status(ctx, boss_name_lower):
+    """Send status for a fixed-time boss"""
+    display_name = ' '.join(word.capitalize() for word in boss_name_lower.split())
+    location = FIXED_BOSSES[boss_name_lower]["location"]
+    next_spawn = get_next_spawn_time(boss_name_lower)
+    current_time = get_ph_time()
+    
+    message = f"**{display_name}**\n📍 **Location:** {location}\n"
+    
+    if next_spawn:
+        if next_spawn <= current_time:
+            message += "**Status:** ✅ **ALIVE**\n"
+        else:
+            time_left = format_time_left(next_spawn - current_time)
+            message += f"**Status:** ❌ **DEAD**\n"
+            message += f"⏰ **Next spawn:** {next_spawn.strftime('%Y-%m-%d %I:%M %p PHT')}\n"
+            message += f"⏳ **Time left:** {time_left}\n"
+        
+        message += "\n**Schedule:**\n"
+        for spawn_info in FIXED_BOSSES[boss_name_lower]["spawn_times"]:
+            message += f"• {spawn_info['day'].capitalize()} at {spawn_info['time']}\n"
+    else:
+        message += "**Status:** ❓ **UNKNOWN**\n"
+    
+    await ctx.send(message)
+
+# ===== BOT EVENTS AND COMMANDS =====
+@bot.event
+async def on_ready():
+    logger.info(f'{bot.user} is online! Tracking {len(ALL_BOSSES)} bosses.')
+    
+    # Load boss data from MongoDB
+    global boss_data
+    loaded_data = await mongodb.load_boss_data()
+    boss_data.update(loaded_data)
+    logger.info(f'Loaded {len(loaded_data)} bosses from database')
+    
+    # Test notification channel
+    channel = bot.get_channel(NOTIFICATION_CHANNEL_ID)
+    if channel:
+        logger.info(f'✅ Found notification channel: {channel.name}')
+        try:
+            await channel.send("🤖 Boss tracker bot is now online and ready! Data loaded from database.")
+        except Exception as e:
+            logger.error(f"Error sending ready message: {e}")
+    else:
+        logger.error(f"❌ Could not find notification channel with ID {NOTIFICATION_CHANNEL_ID}")
+    
+    # Start background tasks
+    if not check_spawns.is_running():
+        check_spawns.start()
+    
+    if not auto_save.is_running():
+        auto_save.start()
+
+@bot.event
+async def on_disconnect():
+    logger.warning("Bot disconnected from Discord")
+
+@bot.event
+async def on_resumed():
+    logger.info("Bot resumed connection to Discord")
+
+@bot.event
+async def on_error(event, *args, **kwargs):
+    logger.error(f'Error in event {event}: {args} {kwargs}')
+
+@bot.command(name='kill')
+async def report_kill(ctx, *, boss_name):
+    boss_name_lower = boss_name.lower()
+
+    if boss_name_lower not in ALL_BOSSES:
+        valid_bosses = ", ".join([f"`{b}`" for b in ALL_BOSSES.keys()])
+        await ctx.send(f"❌ Unknown boss `{boss_name}`.\n**Valid bosses:** {valid_bosses}")
+        return
+
+    if boss_name_lower in FIXED_BOSSES:
+        await ctx.send(f"ℹ️ **{boss_name.capitalize()}** is a fixed-time boss.\nUse `!schedule {boss_name}` for spawn times.")
+        return
+
+    respawn_hours = REGULAR_BOSSES[boss_name_lower]["hours"]
+    kill_time = get_ph_time()
+    spawn_time = kill_time + timedelta(hours=respawn_hours)
+    location = REGULAR_BOSSES[boss_name_lower]["location"]
+
+    boss_data[boss_name_lower] = {
+        "spawn_time": spawn_time,
+        "notified": False,
+        "kill_time": kill_time,
+        "location": location,
+        "type": "regular"
+    }
+
+    # Save to database
+    await save_boss_data()
+
+    display_name = ' '.join(word.capitalize() for word in boss_name_lower.split())
+    kill_str = kill_time.strftime("%I:%M %p PHT")
+    spawn_str = spawn_time.strftime("%I:%M %p PHT")
+    
+    await ctx.send(
+        f"✅ **{display_name}** defeated at `{kill_str}`!\n"
+        f"📍 **Location:** {location}\n"
+        f"⏰ Respawns at `{spawn_str}`\n"
+        f"⏳ In {respawn_hours} hours"
+    )
+
+@bot.command(name='killtime')
+async def report_kill_manual(ctx, boss_name, *, time_input):
+    boss_name_lower = boss_name.lower()
+
+    if boss_name_lower not in ALL_BOSSES:
+        valid_bosses = ", ".join([f"`{b}`" for b in ALL_BOSSES.keys()])
+        await ctx.send(f"❌ Unknown boss `{boss_name}`.\n**Valid bosses:** {valid_bosses}")
+        return
+
+    if boss_name_lower in FIXED_BOSSES:
+        await ctx.send(f"ℹ️ **{boss_name.capitalize()}** is a fixed-time boss.\nUse `!schedule {boss_name}` for spawn times.")
+        return
+
+    try:
+        kill_time = parse_manual_time(time_input)
+        respawn_hours = REGULAR_BOSSES[boss_name_lower]["hours"]
+        spawn_time = kill_time + timedelta(hours=respawn_hours)
+        location = REGULAR_BOSSES[boss_name_lower]["location"]
+
+        boss_data[boss_name_lower] = {
+            "spawn_time": spawn_time,
+            "notified": False,
+            "kill_time": kill_time,
+            "location": location,
+            "type": "regular"
+        }
+
+        # Save to database
+        await save_boss_data()
+
+        display_name = ' '.join(word.capitalize() for word in boss_name_lower.split())
+        kill_str = kill_time.strftime("%Y-%m-%d %I:%M %p PHT")
+        spawn_str = spawn_time.strftime("%Y-%m-%d %I:%M %p PHT")
+        
+        await ctx.send(
+            f"✅ **{display_name}** defeated at `{kill_str}`!\n"
+            f"📍 **Location:** {location}\n"
+            f"⏰ Respawns at `{spawn_str}`\n"
+            f"⏳ In {respawn_hours} hours"
+        )
+
+    except ValueError as e:
+        await ctx.send(f"❌ {e}\n**Valid formats:**\n• `!killtime BossName 14:30`\n• `!killtime BossName 2024-01-15 14:30`")
+
+# ... (keep your other commands like status, bosses, schedule, location, time, test mostly the same)
+# Just add database saving where appropriate
+
+@bot.command(name='cleardata')
+async def clear_data(ctx):
+    """Clear all boss data (admin command)"""
+    # Add permission check here if needed
+    boss_data.clear()
+    if mongodb.is_connected():
+        await mongodb.save_boss_data({})
+    await ctx.send("✅ All boss data cleared!")
+
+@bot.command(name='dbstatus')
+async def db_status(ctx):
+    """Check database connection status"""
+    status = "✅ Connected" if mongodb.is_connected() else "❌ Disconnected"
+    boss_count = len(boss_data)
+    await ctx.send(f"**Database Status:** {status}\n**Bosses in memory:** {boss_count}")
+
+# ===== BACKGROUND TASKS =====
+@tasks.loop(minutes=5.0)
+async def auto_save():
+    """Auto-save boss data to database every 5 minutes"""
+    try:
+        if boss_data:
+            success = await save_boss_data()
+            if success:
+                logger.info("✅ Auto-saved boss data to database")
+            else:
+                logger.warning("❌ Failed to auto-save boss data")
+    except Exception as e:
+        logger.error(f"Error in auto_save: {e}")
+
+@tasks.loop(seconds=30.0)
+async def check_spawns():
+    """Check for boss spawns and send notifications"""
+    try:
+        current_time = get_ph_time()
+        notification_time = current_time + timedelta(minutes=10)
+
+        channel = bot.get_channel(NOTIFICATION_CHANNEL_ID)
+        if not channel:
+            return
+
+        # Check regular bosses
+        for boss_name, boss_info in list(boss_data.items()):
+            if boss_info.get("type") != "regular":
+                continue
+
+            spawn_time = boss_info["spawn_time"]
+            location = boss_info.get("location", "Unknown")
+
+            if current_time < spawn_time <= notification_time and not boss_info["notified"]:
+                display_name = ' '.join(word.capitalize() for word in boss_name.split())
+                time_left = spawn_time - current_time
+                minutes = max(0, int(time_left.total_seconds() // 60))
+
+                try:
+                    await channel.send(
+                        f"@everyone 🚨 **{display_name} SPAWN ALERT!** 🚨\n"
+                        f"📍 **Location:** {location}\n"
+                        f"**Spawning in {minutes} minutes!**\n"
+                        f"⏰ **Spawn time:** {spawn_time.strftime('%I:%M %p PHT')}"
+                    )
+                    boss_info["notified"] = True
+                    await save_boss_data()
+                except Exception as e:
+                    logger.error(f"Error sending spawn alert: {e}")
+
+        # Check fixed-time bosses
+        for boss_name in FIXED_BOSSES:
+            next_spawn = get_next_spawn_time(boss_name)
+            if not next_spawn:
+                continue
+
+            notification_key = f"{boss_name}_notified"
+            already_notified = boss_data.get(notification_key, False)
+
+            if current_time < next_spawn <= notification_time and not already_notified:
+                display_name = ' '.join(word.capitalize() for word in boss_name.split())
+                location = FIXED_BOSSES[boss_name]["location"]
+                time_left = next_spawn - current_time
+                minutes = max(0, int(time_left.total_seconds() // 60))
+
+                try:
+                    await channel.send(
+                        f"@everyone 🚨 **{display_name} SPAWN ALERT!** 🚨\n"
+                        f"📍 **Location:** {location}\n"
+                        f"**Spawning in {minutes} minutes!**\n"
+                        f"⏰ **Spawn time:** {next_spawn.strftime('%I:%M %p PHT')}"
+                    )
+                    boss_data[notification_key] = True
+                    await save_boss_data()
+                except Exception as e:
+                    logger.error(f"Error sending fixed boss alert: {e}")
+
+        # Reset notifications
+        for boss_name, boss_info in list(boss_data.items()):
+            if boss_info.get("type") == "regular" and boss_info["spawn_time"] < current_time:
+                boss_info["notified"] = False
+
+        for boss_name in FIXED_BOSSES:
+            next_spawn = get_next_spawn_time(boss_name)
+            if next_spawn and next_spawn < current_time:
+                boss_data[f"{boss_name}_notified"] = False
+
+    except Exception as e:
+        logger.error(f"Error in check_spawns: {e}")
+
+@check_spawns.before_loop
+@auto_save.before_loop
+async def before_tasks():
+    await bot.wait_until_ready()
+
+# ===== SHUTDOWN HANDLER =====
+async def shutdown():
+    """Clean shutdown procedure"""
+    logger.info("Shutting down bot...")
+    check_spawns.stop()
+    auto_save.stop()
+    # Final save before shutdown
+    if boss_data:
+        await save_boss_data()
+    if mongodb.client:
+        mongodb.client.close()
+
+# Start the keep-alive server
+keep_alive()
+
+# Run the bot with error handling
+try:
+    bot.run(BOT_TOKEN)
+except KeyboardInterrupt:
+    asyncio.run(shutdown())
+except Exception as e:
+    logger.error(f"Bot crashed: {e}")
+    asyncio.run(shutdown())

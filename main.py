@@ -33,7 +33,12 @@ class MongoDBHandler:
                 logger.warning("No MongoDB connection string found. Using in-memory storage only.")
                 return
             
-            self.client = MongoClient(self.connection_string, serverSelectionTimeoutMS=5000)
+            self.client = MongoClient(
+                self.connection_string, 
+                serverSelectionTimeoutMS=5000,
+                connectTimeoutMS=30000,
+                socketTimeoutMS=45000
+            )
             self.client.admin.command('ping')  # Test connection
             self.db = self.client.discord_boss_tracker
             logger.info("✅ Connected to MongoDB successfully")
@@ -41,6 +46,21 @@ class MongoDBHandler:
             logger.error(f"❌ MongoDB connection failed: {e}")
             self.client = None
             self.db = None
+    
+    def reconnect(self):
+        """Attempt to reconnect to MongoDB"""
+        logger.info("Attempting to reconnect to MongoDB...")
+        try:
+            if self.client:
+                self.client.close()
+            self.connect()
+            if self.is_connected():
+                logger.info("✅ MongoDB reconnection successful")
+                return True
+            return False
+        except Exception as e:
+            logger.error(f"❌ MongoDB reconnection failed: {e}")
+            return False
     
     def is_connected(self):
         """Check if MongoDB is connected"""
@@ -53,9 +73,17 @@ class MongoDBHandler:
             return False
     
     async def save_boss_data(self, boss_data):
-        """Save boss data to MongoDB"""
-        if not self.is_connected():
+        """Save boss data to MongoDB with reconnection attempt"""
+        if not self.connection_string:
+            logger.warning("No MongoDB connection string - skipping save")
             return False
+        
+        # Try to reconnect if not connected
+        if not self.is_connected():
+            logger.warning("MongoDB disconnected. Attempting to reconnect...")
+            if not self.reconnect():
+                logger.error("Failed to reconnect to MongoDB - cannot save data")
+                return False
         
         try:
             # Convert datetime objects to strings for storage
@@ -73,14 +101,21 @@ class MongoDBHandler:
                 {'_id': 'current_bosses', 'data': storage_data}, 
                 upsert=True
             )
+            logger.info("✅ Boss data saved to MongoDB successfully")
             return result.acknowledged
         except Exception as e:
             logger.error(f"Error saving boss data: {e}")
+            # Mark as disconnected for next attempt
+            self.client = None
+            self.db = None
             return False
     
     async def load_boss_data(self):
         """Load boss data from MongoDB"""
         if not self.is_connected():
+            if self.connection_string:
+                logger.warning("MongoDB not connected - attempting to reconnect for load")
+                self.reconnect()
             return {}
         
         try:
@@ -95,8 +130,9 @@ class MongoDBHandler:
                             loaded_data[boss_name][key] = datetime.fromisoformat(value)
                         else:
                             loaded_data[boss_name][key] = value
-                logger.info("✅ Loaded boss data from MongoDB")
+                logger.info(f"✅ Loaded {len(loaded_data)} bosses from MongoDB")
                 return loaded_data
+            logger.info("No existing boss data found in MongoDB")
             return {}
         except Exception as e:
             logger.error(f"Error loading boss data: {e}")
@@ -315,7 +351,7 @@ def get_next_spawn_time(boss_name):
 
 async def save_boss_data():
     """Save boss data to MongoDB"""
-    await mongodb.save_boss_data(boss_data)
+    return await mongodb.save_boss_data(boss_data)
 
 async def send_boss_status(ctx, boss_name_lower, boss_info):
     """Send status for a single boss"""
@@ -690,17 +726,48 @@ async def db_status(ctx):
     boss_count = len(boss_data)
     await ctx.send(f"**Database Status:** {status}\n**Bosses in memory:** {boss_count}")
 
+@bot.command(name='forcesave')
+async def force_save(ctx):
+    """Force save boss data to database"""
+    try:
+        if not boss_data:
+            await ctx.send("❌ No boss data to save")
+            return
+            
+        success = await mongodb.save_boss_data(boss_data)
+        if success:
+            await ctx.send("✅ Boss data saved successfully to database!")
+        else:
+            await ctx.send("❌ Failed to save boss data. MongoDB may be disconnected.")
+    except Exception as e:
+        await ctx.send(f"❌ Error saving data: {e}")
+
+@bot.command(name='dbinfo')
+async def db_info(ctx):
+    """Show detailed database information"""
+    status = "✅ Connected" if mongodb.is_connected() else "❌ Disconnected"
+    boss_count = len(boss_data)
+    
+    message = f"**Database Information:**\n"
+    message += f"• **Status:** {status}\n"
+    message += f"• **Bosses in memory:** {boss_count}\n"
+    message += f"• **MongoDB Configured:** {'Yes' if mongodb.connection_string else 'No'}\n"
+    
+    await ctx.send(message)
+
 # ===== BACKGROUND TASKS =====
 @tasks.loop(minutes=5.0)
 async def auto_save():
     """Auto-save boss data to database every 5 minutes"""
     try:
         if boss_data:
-            success = await save_boss_data()
+            success = await mongodb.save_boss_data(boss_data)
             if success:
                 logger.info("✅ Auto-saved boss data to database")
             else:
-                logger.warning("❌ Failed to auto-save boss data")
+                logger.warning("❌ Failed to auto-save boss data - will retry next cycle")
+        else:
+            logger.info("No boss data to save")
     except Exception as e:
         logger.error(f"Error in auto_save: {e}")
 

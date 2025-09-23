@@ -543,7 +543,7 @@ async def check_status(ctx, *, specific_boss=None):
 
         await send_boss_status(ctx, boss_name_lower, boss_info)
     else:
-        # Show status for all bosses - FIXED: Split into multiple messages if too long
+        # Show status for all bosses - FIXED: Proper alignment
         current_time = get_ph_time()
         boss_statuses = []
 
@@ -585,11 +585,13 @@ async def check_status(ctx, *, specific_boss=None):
             location = ALL_BOSSES[boss_name]["location"]
             # Create abbreviated location (take first word)
             short_location = location.split()[0] if ' ' in location else location[:8]
-            # Combine boss name and location
-            display_name_with_location = f"{display_name} ({short_location})"
+            # Combine boss name and location with fixed width
+            name_with_loc = f"{display_name} ({short_location})"
             
             boss_statuses.append({
-                'name': display_name_with_location,
+                'name': display_name,
+                'location': short_location,
+                'name_with_loc': name_with_loc,
                 'status': status,
                 'time_left_seconds': time_left_seconds,
                 'boss_name': boss_name,
@@ -606,40 +608,56 @@ async def check_status(ctx, *, specific_boss=None):
 
         boss_statuses.sort(key=sort_key)
 
+        # Calculate maximum widths for proper alignment
+        max_name_length = max(len(boss['name_with_loc']) for boss in boss_statuses)
+        max_status_length = 12  # Length of "✅ ALIVE" or "❌ DEAD"
+        max_time_length = 12    # For time left
+        max_spawn_length = 14   # For spawn time
+
         # Split into multiple messages if too long
         messages = []
         current_message = "**BOSS STATUS** (Sorted by spawn time)\n```\n"
-        current_message += "BOSS NAME (LOC)      STATUS        TIME LEFT     SPAWN TIME\n"
-        current_message += "──────────────────────────────────────────────────────────\n"
+        
+        # Create header with proper spacing - STATUS moved to align with content
+        header_name = "BOSS NAME (LOC)".ljust(max_name_length + 3)  # +3 for the fire emoji space
+        header_status = "STATUS".ljust(max_status_length)
+        header_time = "TIME LEFT".ljust(max_time_length)
+        header_spawn = "SPAWN TIME"
+        
+        current_message += f"{header_name}{header_status} {header_time} {header_spawn}\n"
+        current_message += "─" * (max_name_length + max_status_length + max_time_length + max_spawn_length + 8) + "\n"
 
         dead_bosses = [boss for boss in boss_statuses if boss['status'] == "❌ DEAD"]
         
         for i, boss in enumerate(boss_statuses):
             if boss['status'] == "✅ ALIVE":
-                time_str = "-".ljust(12)
-                spawn_str = "Now".ljust(14)
+                time_str = "-".ljust(max_time_length)
+                spawn_str = "Now"
             elif boss['status'] == "❌ DEAD":
-                time_str = format_time_left(timedelta(seconds=boss['time_left_seconds'])).ljust(12)
-                spawn_str = boss['spawn_time_str'].ljust(14)
+                time_str = format_time_left(timedelta(seconds=boss['time_left_seconds'])).ljust(max_time_length)
+                spawn_str = boss['spawn_time_str']
             else:
-                time_str = "-".ljust(12)
-                spawn_str = "Unknown".ljust(14)
+                time_str = "-".ljust(max_time_length)
+                spawn_str = "Unknown"
 
-            name_display = boss['name'].ljust(20)  # Increased width for location
+            # Use fixed width for the name with location
+            name_display = boss['name_with_loc'].ljust(max_name_length)
+            status_display = boss['status'].ljust(max_status_length)
             
-            line_content = ""
+            # Align status properly by adjusting spaces
             if boss['status'] == "❌ DEAD" and dead_bosses.index(boss) < 5:
-                line_content = f"🔥 {name_display} {boss['status'].ljust(12)} {time_str} {spawn_str}\n"
+                line_content = f"🔥 {name_display}  {status_display} {time_str} {spawn_str}\n"
             else:
-                line_content = f"   {name_display} {boss['status'].ljust(12)} {time_str} {spawn_str}\n"
+                line_content = f"   {name_display}  {status_display} {time_str} {spawn_str}\n"
 
             # Check if adding this line would exceed Discord's 2000 character limit
             if len(current_message + line_content + "```") > 1900:
                 current_message += "```"
                 messages.append(current_message)
                 current_message = "```\n"
-                current_message += "BOSS NAME (LOC)      STATUS        TIME LEFT     SPAWN TIME\n"
-                current_message += "──────────────────────────────────────────────────────────\n"
+                # Recreate header for new message
+                current_message += f"{header_name}{header_status} {header_time} {header_spawn}\n"
+                current_message += "─" * (max_name_length + max_status_length + max_time_length + max_spawn_length + 8) + "\n"
             
             current_message += line_content
 

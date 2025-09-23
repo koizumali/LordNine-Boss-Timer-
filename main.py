@@ -555,12 +555,16 @@ async def check_status(ctx, *, specific_boss=None):
                     if time_left.total_seconds() <= 0:
                         status = "✅ ALIVE"
                         time_left_seconds = 0
+                        spawn_time_str = "Now"
                     else:
                         status = "❌ DEAD"
                         time_left_seconds = time_left.total_seconds()
+                        # New format: Hour(standard time with pm and am)/Minutes and date/month(with 3 letters)
+                        spawn_time_str = next_spawn.strftime("%I:%M %p/%d %b")
                 else:
                     status = "❓ UNKNOWN"
                     time_left_seconds = float('inf')
+                    spawn_time_str = "Unknown"
             else:
                 boss_info = boss_data.get(boss_name)
                 if boss_info:
@@ -568,19 +572,24 @@ async def check_status(ctx, *, specific_boss=None):
                     if current_time > spawn_time:
                         status = "✅ ALIVE"
                         time_left_seconds = 0
+                        spawn_time_str = "Now"
                     else:
                         status = "❌ DEAD"
                         time_left_seconds = (spawn_time - current_time).total_seconds()
+                        # New format: Hour(standard time with pm and am)/Minutes and date/month(with 3 letters)
+                        spawn_time_str = spawn_time.strftime("%I:%M %p/%d %b")
                 else:
                     status = "❓ NOT KILLED"
                     time_left_seconds = float('inf')
+                    spawn_time_str = "Unknown"
 
             display_name = ' '.join(word.capitalize() for word in boss_name.split())
             boss_statuses.append({
                 'name': display_name,
                 'status': status,
                 'time_left_seconds': time_left_seconds,
-                'boss_name': boss_name
+                'boss_name': boss_name,
+                'spawn_time_str': spawn_time_str  # Add the formatted spawn time
             })
 
         def sort_key(boss):
@@ -595,27 +604,31 @@ async def check_status(ctx, *, specific_boss=None):
 
         message = "**BOSS STATUS** (Sorted by spawn time)\n"
         message += "```\n"
-        message += "BOSS NAME           STATUS        TIME LEFT\n"
-        message += "───────────────────────────────────────────\n"
+        message += "BOSS NAME           STATUS        TIME LEFT     SPAWN TIME\n"
+        message += "──────────────────────────────────────────────────────────\n"
 
         dead_bosses = [boss for boss in boss_statuses if boss['status'] == "❌ DEAD"]
         
         for boss in boss_statuses:
             if boss['status'] == "✅ ALIVE":
                 time_str = "-".ljust(12)
+                spawn_str = "Now".ljust(14)
             elif boss['status'] == "❌ DEAD":
                 time_str = format_time_left(timedelta(seconds=boss['time_left_seconds'])).ljust(12)
+                spawn_str = boss['spawn_time_str'].ljust(14)
             else:
                 time_str = "-".ljust(12)
+                spawn_str = "Unknown".ljust(14)
 
             name_display = boss['name'].ljust(18)
             
             if boss['status'] == "❌ DEAD" and dead_bosses.index(boss) < 5:
-                message += f"🔥 {name_display} {boss['status'].ljust(12)} {time_str}\n"
+                message += f"🔥 {name_display} {boss['status'].ljust(12)} {time_str} {spawn_str}\n"
             else:
-                message += f"   {name_display} {boss['status'].ljust(12)} {time_str}\n"
+                message += f"   {name_display} {boss['status'].ljust(12)} {time_str} {spawn_str}\n"
 
         message += "```"
+        message += f"\n**Format:** Time: `HH:MM AM/PM` Date: `DD MMM` (e.g., 02:30 PM/15 Jan)"
         
         await ctx.send(message)
 

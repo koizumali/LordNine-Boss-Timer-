@@ -89,6 +89,10 @@ class MongoDBHandler:
             # Convert datetime objects to strings for storage
             storage_data = {}
             for boss_name, data in boss_data.items():
+                # Skip notification flags (they're stored as booleans, not dicts)
+                if not isinstance(data, dict):
+                    continue
+                    
                 storage_data[boss_name] = {}
                 for key, value in data.items():
                     if isinstance(value, datetime):
@@ -755,6 +759,51 @@ async def db_info(ctx):
     
     await ctx.send(message)
 
+@bot.command(name='debugdb')
+async def debug_db(ctx):
+    """Debug MongoDB connection"""
+    has_uri = bool(mongodb.connection_string)
+    is_connected = mongodb.is_connected()
+    
+    message = f"**MongoDB Debug:**\n"
+    message += f"• URI Configured: {'✅ Yes' if has_uri else '❌ No'}\n"
+    message += f"• Connection Status: {'✅ Connected' if is_connected else '❌ Disconnected'}\n"
+    
+    if has_uri:
+        # Show first few characters of URI (don't show full URI for security)
+        message += f"• URI Starts with: {mongodb.connection_string[:20]}...\n"
+    else:
+        message += f"• **ERROR:** No MONGODB_URI found in environment variables!\n"
+    
+    await ctx.send(message)
+
+@bot.command(name='debugdata')
+async def debug_data(ctx):
+    """Debug boss data structure"""
+    if not boss_data:
+        await ctx.send("No boss data in memory")
+        return
+        
+    message = "**Boss Data Structure:**\n"
+    for boss_name, data in boss_data.items():
+        message += f"\n**{boss_name}**: {type(data)}\n"
+        if isinstance(data, dict):
+            for key, value in data.items():
+                message += f"  - {key}: {type(value)}"
+                if isinstance(value, datetime):
+                    message += f" ({value.strftime('%Y-%m-%d %H:%M')})"
+                message += "\n"
+        else:
+            message += f"  Value: {data}\n"
+    
+    # Split long messages if needed
+    if len(message) > 1900:
+        parts = [message[i:i+1900] for i in range(0, len(message), 1900)]
+        for part in parts:
+            await ctx.send(f"```{part}```")
+    else:
+        await ctx.send(f"```{message}```")
+
 # ===== BACKGROUND TASKS =====
 @tasks.loop(minutes=5.0)
 async def auto_save():
@@ -782,13 +831,33 @@ async def check_spawns():
         if not channel:
             return
 
-        # Check regular bosses
+        # Check regular bosses - FIXED: Added proper type checking
         for boss_name, boss_info in list(boss_data.items()):
+            # Skip if it's a notification flag (ends with _notified)
+            if boss_name.endswith('_notified'):
+                continue
+                
+            # Ensure boss_info is a dictionary and has the expected structure
+            if not isinstance(boss_info, dict):
+                logger.warning(f"Skipping invalid boss data for {boss_name}: {type(boss_info)}")
+                continue
+                
+            # Only process regular bosses
             if boss_info.get("type") != "regular":
+                continue
+
+            # Check if required fields exist
+            if "spawn_time" not in boss_info or "notified" not in boss_info:
+                logger.warning(f"Skipping boss {boss_name} with missing data")
                 continue
 
             spawn_time = boss_info["spawn_time"]
             location = boss_info.get("location", "Unknown")
+
+            # Ensure spawn_time is a datetime object
+            if not isinstance(spawn_time, datetime):
+                logger.warning(f"Invalid spawn_time for {boss_name}: {type(spawn_time)}")
+                continue
 
             if current_time < spawn_time <= notification_time and not boss_info["notified"]:
                 display_name = ' '.join(word.capitalize() for word in boss_name.split())
@@ -807,42 +876,57 @@ async def check_spawns():
                 except Exception as e:
                     logger.error(f"Error sending spawn alert: {e}")
 
-        # Check fixed-time bosses
+        # Check fixed-time bosses - FIXED: Added proper error handling
         for boss_name in FIXED_BOSSES:
-            next_spawn = get_next_spawn_time(boss_name)
-            if not next_spawn:
-                continue
+            try:
+                next_spawn = get_next_spawn_time(boss_name)
+                if not next_spawn:
+                    continue
 
-            notification_key = f"{boss_name}_notified"
-            already_notified = boss_data.get(notification_key, False)
+                notification_key = f"{boss_name}_notified"
+                already_notified = boss_data.get(notification_key, False)
 
-            if current_time < next_spawn <= notification_time and not already_notified:
-                display_name = ' '.join(word.capitalize() for word in boss_name.split())
-                location = FIXED_BOSSES[boss_name]["location"]
-                time_left = next_spawn - current_time
-                minutes = max(0, int(time_left.total_seconds() // 60))
+                if current_time < next_spawn <= notification_time and not already_notified:
+                    display_name = ' '.join(word.capitalize() for word in boss_name.split())
+                    location = FIXED_BOSSES[boss_name]["location"]
+                    time_left = next_spawn - current_time
+                    minutes = max(0, int(time_left.total_seconds() // 60))
 
-                try:
-                    await channel.send(
-                        f"@everyone 🚨 **{display_name} SPAWN ALERT!** 🚨\n"
-                        f"📍 **Location:** {location}\n"
-                        f"**Spawning in {minutes} minutes!**\n"
-                        f"⏰ **Spawn time:** {next_spawn.strftime('%I:%M %p PHT')}"
-                    )
-                    boss_data[notification_key] = True
-                    await save_boss_data()
-                except Exception as e:
-                    logger.error(f"Error sending fixed boss alert: {e}")
+                    try:
+                        await channel.send(
+                            f"@everyone 🚨 **{display_name} SPAWN ALERT!** 🚨\n"
+                            f"📍 **Location:** {location}\n"
+                            f"**Spawning in {minutes} minutes!**\n"
+                            f"⏰ **Spawn time:** {next_spawn.strftime('%I:%M %p PHT')}"
+                        )
+                        boss_data[notification_key] = True
+                        await save_boss_data()
+                    except Exception as e:
+                        logger.error(f"Error sending fixed boss alert: {e}")
+            except Exception as e:
+                logger.error(f"Error processing fixed boss {boss_name}: {e}")
 
-        # Reset notifications
+        # Reset notifications - FIXED: Added proper type checking
         for boss_name, boss_info in list(boss_data.items()):
-            if boss_info.get("type") == "regular" and boss_info["spawn_time"] < current_time:
-                boss_info["notified"] = False
+            # Skip notification flags
+            if boss_name.endswith('_notified'):
+                continue
+                
+            if not isinstance(boss_info, dict):
+                continue
+                
+            if boss_info.get("type") == "regular" and "spawn_time" in boss_info:
+                spawn_time = boss_info["spawn_time"]
+                if isinstance(spawn_time, datetime) and spawn_time < current_time:
+                    boss_info["notified"] = False
 
         for boss_name in FIXED_BOSSES:
-            next_spawn = get_next_spawn_time(boss_name)
-            if next_spawn and next_spawn < current_time:
-                boss_data[f"{boss_name}_notified"] = False
+            try:
+                next_spawn = get_next_spawn_time(boss_name)
+                if next_spawn and next_spawn < current_time:
+                    boss_data[f"{boss_name}_notified"] = False
+            except Exception as e:
+                logger.error(f"Error resetting notification for {boss_name}: {e}")
 
     except Exception as e:
         logger.error(f"Error in check_spawns: {e}")

@@ -582,8 +582,14 @@ async def check_status(ctx, *, specific_boss=None):
                     spawn_time_str = "Unknown"
 
             display_name = ' '.join(word.capitalize() for word in boss_name.split())
+            location = ALL_BOSSES[boss_name]["location"]
+            # Create abbreviated location (take first word)
+            short_location = location.split()[0] if ' ' in location else location[:8]
+            # Combine boss name and location
+            display_name_with_location = f"{display_name} ({short_location})"
+            
             boss_statuses.append({
-                'name': display_name,
+                'name': display_name_with_location,
                 'status': status,
                 'time_left_seconds': time_left_seconds,
                 'boss_name': boss_name,
@@ -603,7 +609,7 @@ async def check_status(ctx, *, specific_boss=None):
         # Split into multiple messages if too long
         messages = []
         current_message = "**BOSS STATUS** (Sorted by spawn time)\n```\n"
-        current_message += "BOSS NAME           STATUS        TIME LEFT     SPAWN TIME\n"
+        current_message += "BOSS NAME (LOC)      STATUS        TIME LEFT     SPAWN TIME\n"
         current_message += "──────────────────────────────────────────────────────────\n"
 
         dead_bosses = [boss for boss in boss_statuses if boss['status'] == "❌ DEAD"]
@@ -619,7 +625,7 @@ async def check_status(ctx, *, specific_boss=None):
                 time_str = "-".ljust(12)
                 spawn_str = "Unknown".ljust(14)
 
-            name_display = boss['name'].ljust(18)
+            name_display = boss['name'].ljust(20)  # Increased width for location
             
             line_content = ""
             if boss['status'] == "❌ DEAD" and dead_bosses.index(boss) < 5:
@@ -632,7 +638,7 @@ async def check_status(ctx, *, specific_boss=None):
                 current_message += "```"
                 messages.append(current_message)
                 current_message = "```\n"
-                current_message += "BOSS NAME           STATUS        TIME LEFT     SPAWN TIME\n"
+                current_message += "BOSS NAME (LOC)      STATUS        TIME LEFT     SPAWN TIME\n"
                 current_message += "──────────────────────────────────────────────────────────\n"
             
             current_message += line_content

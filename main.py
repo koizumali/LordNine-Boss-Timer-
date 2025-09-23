@@ -543,7 +543,7 @@ async def check_status(ctx, *, specific_boss=None):
 
         await send_boss_status(ctx, boss_name_lower, boss_info)
     else:
-        # Show status for all bosses
+        # Show status for all bosses - FIXED: Split into multiple messages if too long
         current_time = get_ph_time()
         boss_statuses = []
 
@@ -559,7 +559,6 @@ async def check_status(ctx, *, specific_boss=None):
                     else:
                         status = "❌ DEAD"
                         time_left_seconds = time_left.total_seconds()
-                        # New format: Hour(standard time with pm and am)/Minutes and date/month(with 3 letters)
                         spawn_time_str = next_spawn.strftime("%I:%M %p/%d %b")
                 else:
                     status = "❓ UNKNOWN"
@@ -576,7 +575,6 @@ async def check_status(ctx, *, specific_boss=None):
                     else:
                         status = "❌ DEAD"
                         time_left_seconds = (spawn_time - current_time).total_seconds()
-                        # New format: Hour(standard time with pm and am)/Minutes and date/month(with 3 letters)
                         spawn_time_str = spawn_time.strftime("%I:%M %p/%d %b")
                 else:
                     status = "❓ NOT KILLED"
@@ -589,7 +587,7 @@ async def check_status(ctx, *, specific_boss=None):
                 'status': status,
                 'time_left_seconds': time_left_seconds,
                 'boss_name': boss_name,
-                'spawn_time_str': spawn_time_str  # Add the formatted spawn time
+                'spawn_time_str': spawn_time_str
             })
 
         def sort_key(boss):
@@ -602,14 +600,15 @@ async def check_status(ctx, *, specific_boss=None):
 
         boss_statuses.sort(key=sort_key)
 
-        message = "**BOSS STATUS** (Sorted by spawn time)\n"
-        message += "```\n"
-        message += "BOSS NAME           STATUS        TIME LEFT     SPAWN TIME\n"
-        message += "──────────────────────────────────────────────────────────\n"
+        # Split into multiple messages if too long
+        messages = []
+        current_message = "**BOSS STATUS** (Sorted by spawn time)\n```\n"
+        current_message += "BOSS NAME           STATUS        TIME LEFT     SPAWN TIME\n"
+        current_message += "──────────────────────────────────────────────────────────\n"
 
         dead_bosses = [boss for boss in boss_statuses if boss['status'] == "❌ DEAD"]
         
-        for boss in boss_statuses:
+        for i, boss in enumerate(boss_statuses):
             if boss['status'] == "✅ ALIVE":
                 time_str = "-".ljust(12)
                 spawn_str = "Now".ljust(14)
@@ -622,38 +621,61 @@ async def check_status(ctx, *, specific_boss=None):
 
             name_display = boss['name'].ljust(18)
             
+            line_content = ""
             if boss['status'] == "❌ DEAD" and dead_bosses.index(boss) < 5:
-                message += f"🔥 {name_display} {boss['status'].ljust(12)} {time_str} {spawn_str}\n"
+                line_content = f"🔥 {name_display} {boss['status'].ljust(12)} {time_str} {spawn_str}\n"
             else:
-                message += f"   {name_display} {boss['status'].ljust(12)} {time_str} {spawn_str}\n"
+                line_content = f"   {name_display} {boss['status'].ljust(12)} {time_str} {spawn_str}\n"
 
-        message += "```"
-        message += f"\n**Format:** Time: `HH:MM AM/PM` Date: `DD MMM` (e.g., 02:30 PM/15 Jan)"
+            # Check if adding this line would exceed Discord's 2000 character limit
+            if len(current_message + line_content + "```") > 1900:
+                current_message += "```"
+                messages.append(current_message)
+                current_message = "```\n"
+                current_message += "BOSS NAME           STATUS        TIME LEFT     SPAWN TIME\n"
+                current_message += "──────────────────────────────────────────────────────────\n"
+            
+            current_message += line_content
+
+        current_message += "```"
+        messages.append(current_message)
         
-        await ctx.send(message)
+        # Add format explanation to the last message
+        if messages:
+            messages[-1] += f"\n**Format:** Time: `HH:MM AM/PM` Date: `DD MMM` (e.g., 02:30 PM/15 Jan)"
+        
+        # Send all messages
+        for message in messages:
+            if message.strip():  # Only send non-empty messages
+                await ctx.send(message)
 
 @bot.command(name='bosses')
 async def list_bosses(ctx):
-    message = "**AVAILABLE BOSSES**\n"
-    message += "```\n"
-    message += "BOSS NAME           TYPE         LOCATION\n"
-    message += "───────────────────────────────────────────────────\n"
-
+    # Split the bosses list into multiple messages if too long
+    regular_bosses_msg = "**REGULAR BOSSES** (Respawn timer)\n```\n"
+    regular_bosses_msg += "BOSS NAME           HOURS  LOCATION\n"
+    regular_bosses_msg += "─────────────────────────────────────────\n"
+    
+    fixed_bosses_msg = "**FIXED-TIME BOSSES** (Scheduled spawns)\n```\n"
+    fixed_bosses_msg += "BOSS NAME           LOCATION\n"
+    fixed_bosses_msg += "─────────────────────────────────────\n"
+    
     for boss_name, boss_info in sorted(ALL_BOSSES.items()):
         display_name = ' '.join(word.capitalize() for word in boss_name.split())
         name_display = display_name.ljust(18)
-
-        if boss_name in FIXED_BOSSES:
-            type_display = "FIXED-TIME".ljust(12)
-        else:
-            type_display = f"{boss_info['hours']}H".ljust(12)
-
         location_display = boss_info["location"][:25]
-        message += f"{name_display} {type_display} {location_display}\n"
-
-    message += "```\n"
-    message += "**Legend:**\n• H = Hours respawn timer\n• FIXED-TIME = Spawns at specific times"
-    await ctx.send(message)
+        
+        if boss_name in FIXED_BOSSES:
+            fixed_bosses_msg += f"{name_display} {location_display}\n"
+        else:
+            hours_display = f"{boss_info['hours']}H".ljust(6)
+            regular_bosses_msg += f"{name_display} {hours_display} {location_display}\n"
+    
+    regular_bosses_msg += "```"
+    fixed_bosses_msg += "```"
+    
+    await ctx.send(regular_bosses_msg)
+    await ctx.send(fixed_bosses_msg)
 
 @bot.command(name='schedule')
 async def get_schedule(ctx, *, boss_name):
@@ -844,22 +866,18 @@ async def check_spawns():
         if not channel:
             return
 
-        # Check regular bosses - FIXED: Added proper type checking
+        # Check regular bosses
         for boss_name, boss_info in list(boss_data.items()):
-            # Skip if it's a notification flag (ends with _notified)
             if boss_name.endswith('_notified'):
                 continue
                 
-            # Ensure boss_info is a dictionary and has the expected structure
             if not isinstance(boss_info, dict):
                 logger.warning(f"Skipping invalid boss data for {boss_name}: {type(boss_info)}")
                 continue
                 
-            # Only process regular bosses
             if boss_info.get("type") != "regular":
                 continue
 
-            # Check if required fields exist
             if "spawn_time" not in boss_info or "notified" not in boss_info:
                 logger.warning(f"Skipping boss {boss_name} with missing data")
                 continue
@@ -867,7 +885,6 @@ async def check_spawns():
             spawn_time = boss_info["spawn_time"]
             location = boss_info.get("location", "Unknown")
 
-            # Ensure spawn_time is a datetime object
             if not isinstance(spawn_time, datetime):
                 logger.warning(f"Invalid spawn_time for {boss_name}: {type(spawn_time)}")
                 continue
@@ -889,7 +906,7 @@ async def check_spawns():
                 except Exception as e:
                     logger.error(f"Error sending spawn alert: {e}")
 
-        # Check fixed-time bosses - FIXED: Added proper error handling
+        # Check fixed-time bosses
         for boss_name in FIXED_BOSSES:
             try:
                 next_spawn = get_next_spawn_time(boss_name)
@@ -919,9 +936,8 @@ async def check_spawns():
             except Exception as e:
                 logger.error(f"Error processing fixed boss {boss_name}: {e}")
 
-        # Reset notifications - FIXED: Added proper type checking
+        # Reset notifications
         for boss_name, boss_info in list(boss_data.items()):
-            # Skip notification flags
             if boss_name.endswith('_notified'):
                 continue
                 
